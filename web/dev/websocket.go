@@ -1,7 +1,10 @@
 package dev
 
 import (
-	"github.com/sasha-s/go-deadlock"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
@@ -14,28 +17,34 @@ type ServerStatus struct {
 	Building bool `json:"building"`
 }
 
-var (
-	status  = ServerStatus{}
-	clients = make(map[*WsClient]bool)
-	wsLock  deadlock.RWMutex
-)
-
 type WsClient struct {
-	Conn   *websocket.Conn
-	remote string
-	Tags   map[string]interface{}
+	Conn      *websocket.Conn
+	netConn   net.Conn
+	server    *DevServer
+	remote    string
+	Tags      map[string]interface{}
+	writeLock sync.Mutex
+	closed    atomic.Bool
 }
 
-func NewWsClient(c *websocket.Conn) *WsClient {
+func (s *DevServer) NewWsClient(c *websocket.Conn) *WsClient {
 	client := &WsClient{
-		Conn:   c,
-		remote: c.RemoteAddr().String(),
-		Tags:   make(map[string]interface{}),
+		Conn:    c,
+		netConn: c.NetConn(),
+		server:  s,
+		remote:  c.RemoteAddr().String(),
+		Tags:    make(map[string]interface{}),
 	}
 
-	wsLock.Lock()
-	clients[client] = true
-	wsLock.Unlock()
+	s.wsMu.Lock()
+	if s.stopped.Load() {
+		s.wsMu.Unlock()
+		client.closed.Store(true)
+		_ = client.netConn.SetDeadline(time.Now())
+		return client
+	}
+	s.clients[client] = struct{}{}
+	s.wsMu.Unlock()
 
 	return client
 }
@@ -43,9 +52,6 @@ func NewWsClient(c *websocket.Conn) *WsClient {
 func (c *WsClient) HandleForever() {
 	log.Debug("dev ws client joined", zap.String("ip", c.remote))
 	for {
-		if c.Conn == nil {
-			break
-		}
 		mt, data, err := c.Conn.ReadMessage()
 		if err != nil {
 			log.Warn("ws read fail", zap.Error(err))
@@ -79,7 +85,7 @@ func (c *WsClient) HandleForever() {
 			c.WriteMsg(map[string]interface{}{
 				"id":   id,
 				"type": "status",
-				"data": status,
+				"data": c.server.Status(),
 			})
 		default:
 			c.WriteMsg(map[string]interface{}{"error": "unsupported action"})
@@ -88,12 +94,14 @@ func (c *WsClient) HandleForever() {
 }
 
 func (c *WsClient) WriteMsg(msg map[string]interface{}) {
-	if c.Conn == nil {
-		return
-	}
 	data, err := utils.Marshal(msg)
 	if err != nil {
 		log.Warn("marshal ws msg fail", zap.Error(err))
+		return
+	}
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	if c.closed.Load() {
 		return
 	}
 	err = c.Conn.WriteMessage(websocket.TextMessage, data)
@@ -103,35 +111,105 @@ func (c *WsClient) WriteMsg(msg map[string]interface{}) {
 }
 
 func (c *WsClient) Close() {
-	wsLock.Lock()
-	delete(clients, c)
-	wsLock.Unlock()
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+	if c.server != nil {
+		c.server.wsMu.Lock()
+		delete(c.server.clients, c)
+		c.server.wsMu.Unlock()
+	}
 
-	_ = c.Conn.Close()
-	c.Conn = nil
+	if c.netConn != nil {
+		_ = c.netConn.SetDeadline(time.Now())
+	}
 	log.Debug("dev ws client removed", zap.String("addr", c.remote))
 }
 
-func BroadcastWS(tag string, msg map[string]interface{}) {
-	wsLock.RLock()
-	defer wsLock.RUnlock()
+func (c *WsClient) interrupt() {
+	if c == nil || c.netConn == nil {
+		return
+	}
+	_ = c.netConn.SetDeadline(time.Now())
+}
 
-	for client := range clients {
+func (s *DevServer) BroadcastWS(tag string, msg map[string]interface{}) {
+	if s == nil {
+		return
+	}
+	s.wsMu.RLock()
+	targets := make([]*WsClient, 0, len(s.clients))
+	for client := range s.clients {
 		if tag == "" {
-			// 无tag时广播给所有客户端
-			client.WriteMsg(msg)
-		} else {
-			// 有tag时只广播给包含此tag的客户端
-			if _, ok := client.Tags[tag]; ok {
-				client.WriteMsg(msg)
-			}
+			targets = append(targets, client)
+		} else if _, ok := client.Tags[tag]; ok {
+			targets = append(targets, client)
 		}
+	}
+	s.wsMu.RUnlock()
+
+	for _, client := range targets {
+		client.WriteMsg(msg)
 	}
 }
 
-func BroadcastStatus() {
-	BroadcastWS("", map[string]interface{}{
+func (s *DevServer) Status() ServerStatus {
+	if s == nil {
+		return ServerStatus{}
+	}
+	s.wsMu.RLock()
+	defer s.wsMu.RUnlock()
+	return s.status
+}
+
+func (s *DevServer) SetStatus(status ServerStatus) {
+	if s == nil {
+		return
+	}
+	s.wsMu.Lock()
+	s.status = status
+	s.wsMu.Unlock()
+}
+
+func (s *DevServer) setDirtyBin() {
+	if s == nil {
+		return
+	}
+	s.wsMu.Lock()
+	s.status.DirtyBin = true
+	s.wsMu.Unlock()
+}
+
+func (s *DevServer) beginBuild() bool {
+	if s == nil {
+		return false
+	}
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.status.Building {
+		return false
+	}
+	s.status.DirtyBin = false
+	s.status.Building = true
+	return true
+}
+
+func (s *DevServer) finishBuild() {
+	if s == nil {
+		return
+	}
+	s.buildMu.Lock()
+	s.wsMu.Lock()
+	s.status.Building = false
+	s.wsMu.Unlock()
+	s.buildMu.Unlock()
+}
+
+func (s *DevServer) BroadcastStatus() {
+	s.BroadcastWS("", map[string]interface{}{
 		"type": "status",
-		"data": status,
+		"data": s.Status(),
 	})
 }

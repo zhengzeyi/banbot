@@ -11,20 +11,25 @@ Public fields:
 - `Name string` - Strategy name
 - `Version int` - Strategy version number
 - `WarmupNum int` - Number of candlesticks needed for warmup
-- `MinTfScore float64` - Minimum time frame quality, default 0.75
+- `MinTfScore float64` - Minimum time frame quality, default 0.8
 - `WsSubs map[string]string` - WsSubs        map[string]string    // websocket subscription: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - Whether to enable drawdown exit
 - `HedgeOff bool` - turn off future hedge mode
-- `BatchInOut bool` - Whether to batch execute entry/exit
-- `BatchInfo bool` - Whether to perform batch processing after OnInfoBar
+- `BatchInOut bool` - Whether to batch execute entry/exit after main `OnData(RoleMain)`/`OnBar`
+- `BatchInfo bool` - Whether to batch process after auxiliary `OnData(RoleInfo)`/`OnInfoBar`
 - `StakeRate float64` - Relative basic amount billing rate
 - `StopLoss float64` - Stop loss rate for all orders opened by this strategy (without leverage)
 - `StopEnterBars int` - Timeout candlestick number for limit entry orders
 - `EachMaxLong int` - Maximum number of long orders per trading pair, -1 to disable
 - `EachMaxShort int` - Maximum number of short orders per trading pair, -1 to disable
-- `AllowTFs []string` - Allowed running time periods, use global configuration when not provided
+- `RunTimeFrames []string` - Allowed running time periods; when omitted, the default comes from the current Runtime configuration snapshot
 - `Outputs []string` - Content of the text file output by the strategy, where each string is one line
 - `Policy *config.RunPolicyConfig` - Strategy running configuration
+- `OnDataSubs` - Declares K-line extension columns or custom time-series subscriptions
+- `OnData` - Receives a unified `strat.DataEvent`, which embeds updated Series/latest values from `*strat.DataFields` and identifies primary K-lines, auxiliary K-lines, or custom time-series
+- `OnWsData` - Receives websocket time-series events
+
+Assign `OnData` directly when there are no auxiliary or custom subscriptions. Use `RouteData(DataHandlers{...})` when event filtering is required. `OnData` cannot be configured together with `OnBar` or `OnInfoBar`.
 
 ### StratJob
 Strategy task instance, responsible for executing specific trading operations.
@@ -55,6 +60,22 @@ Public fields:
 - `ShortTPPrice float64` - Default short take profit price when opening position
 - `IsWarmUp bool` - Whether currently in warmup state
 - `More interface{}` - Additional information for strategy customization
+- `DataHub` - Caches the latest events and window data by `(source, sid, timeframe)`
+
+### DataSub
+Time-series subscription information.
+
+Public fields:
+- `Source string` - Data source name; an empty value is equivalent to `kline`
+- `ExSymbol *orm.ExSymbol` - Bound trading symbol
+- `TimeFrame string` - Data source base timeframe
+- `WarmupNum int` - Initial warmup count
+- `Fields []string` - Fields to read
+
+### DataHub
+Runtime data cache. `Get(tf, source, sid)` returns processed `DataFields`, and `AllReady()` determines whether all subscriptions that should be closed at the current event time have been updated. See [Custom Time-Series Data](../guide/custom_data.md) for subscription and consumption examples.
+
+`OnBatchJobs` receives main-timeframe jobs only and is enabled by `BatchInOut`; auxiliary-timeframe jobs go to `OnBatchInfos`, enabled by `BatchInfo`.
 
 ### JobEnv
 Represents a job for additional product data in OnBatchInfos.
@@ -64,8 +85,11 @@ Public fields:
 - `Env *ta.BarEnv` - Indicator runtime environment
 - `Symbol string` - Trading pair name
 
-### BatchMap
-Batch execution task pool for all targets in the current exchange market time cycle.
+### BatchState / BatchMap
+
+`BatchState` owns one trader’s batch queue and backtest batch timestamp. Create it with `NewBatchState`, enqueue with `AddTask`, consume ready batches with `TakeReady(currMS, deterministic)`, query `PendingCount`, and clear with `Reset`. Strict backtests use deterministic ordering; ordinary mode does not promise order. `LegacyBatchState` serves package compatibility calls only.
+
+`BatchMap` represents one timeframe task group inside the queue, rather than process-shared market state.
 
 Public fields:
 - `Map map[string]*JobEnv` - Task mapping
@@ -243,4 +267,10 @@ Returns:
 - `*errs.Error` - Error information
 
 ### ExitStratJobs
-Exit all strategy jobs. 
+Exit all strategy jobs.
+
+## Factor-engine integration
+
+TradeStrat is time-series; graphs and combination live in factor/runner. DataHub rawMap NULL/missing semantics coexist with numerical views.
+
+[Factor API](factor.md) / [Guide](../guide/factor.md)

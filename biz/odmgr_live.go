@@ -1,11 +1,13 @@
 package biz
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/banbox/banbot/com"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/orm/ormo"
@@ -31,6 +34,13 @@ type FuncHandleMyOrder = func(trade *banexg.Order) bool
 
 type LiveOrderMgr struct {
 	OrderMgr
+	coreState        *core.State
+	orderNamespace   string
+	orderEvents      exg.OrderEventCapability
+	pairVolMap       map[string]*PairValItem
+	volPrices        map[string]*VolPrice
+	lockPairVolMap   deadlock.Mutex
+	lockVolPrices    deadlock.Mutex
 	queue            chan *OdQItem
 	doneKeys         map[string]int64            // Completed Orders 已完成的订单：symbol+orderId
 	exgIdMap         map[string]*ormo.InOutOrder // symbol+orderId: InOutOrder
@@ -46,6 +56,11 @@ type LiveOrderMgr struct {
 	lockUnMatches    deadlock.Mutex             // Prevent concurrent reading and writing of unMatchTrades 防止并发读写unMatchTrades
 	exitByMyOrder    FuncHandleMyOrder          // Try to use the transaction results of other end operations to update the current order status 尝试使用其他端操作的交易结果，更新当前订单状态
 	traceExgOrder    FuncHandleMyOrder
+	workerLock       sync.Mutex
+	workerCtx        context.Context
+	workerCancel     context.CancelFunc
+	workerWait       sync.WaitGroup
+	workerSealed     bool
 }
 
 type OdQItem struct {
@@ -54,9 +69,12 @@ type OdQItem struct {
 }
 
 const (
-	AmtDust                 = 1e-8
-	odInfoLocalTrigger      = "LocalTrigger"
-	restoreAmbiguousExgData = "ambiguous_exchange_entries"
+	AmtDust                          = 1e-8
+	odInfoLocalTrigger               = "LocalTrigger"
+	restoreAmbiguousExgData          = "ambiguous_exchange_entries"
+	openOrderSnapshotLimit           = 1000
+	pendingMarketEntryReconcileAfter = 20 * time.Second
+	defaultMyTradeWatchRetry         = 5 * time.Second
 )
 
 var (
@@ -73,15 +91,75 @@ type PairValItem struct {
 }
 
 func InitLiveOrderMgr(callBack func(od *ormo.InOutOrder, isEnter bool)) {
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	initLiveOrderMgr(nil, callBack)
+}
+
+// InitLiveOrderMgrWithRuntimeDeps binds live order event correlation and pair
+// admission to one explicit runtime. The legacy initializer remains available
+// for callers that still use the package facade.
+func InitLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, callBack func(od *ormo.InOutOrder, isEnter bool)) {
+	if deps.SharedExecution != nil {
+		initSharedOrderMgr(deps, callBack)
+		return
+	}
+	requireRuntimeDeps(deps)
+	initLiveOrderMgr(&deps, callBack)
+}
+
+// NewLiveOrderMgrWithRuntimeDeps constructs one isolated live order manager.
+// It is useful to compose a manager directly without installing the legacy
+// account registry.
+func NewLiveOrderMgrWithRuntimeDeps(deps RuntimeDeps, account string, callBack func(od *ormo.InOutOrder, isEnter bool)) *LiveOrderMgr {
+	requireRuntimeDeps(deps)
+	if deps.SharedExecution != nil {
+		panic("biz: shared account cannot construct independent LiveOrderMgr")
+	}
+	return newLiveOrderMgrWithRuntimeDeps(account, callBack, &deps)
+}
+
+func initLiveOrderMgr(deps *RuntimeDeps, callBack func(od *ormo.InOutOrder, isEnter bool)) {
+	ensureLiveRuntimeDeps(deps)
+	if deps != nil && deps.Trading != nil {
+		accounts := deps.AccountConfigs()
+		for account, cfg := range accounts {
+			if cfg == nil || cfg.NoTrade {
+				continue
+			}
+			mgr := deps.Trading.LiveManager(account)
+			if mgr == nil {
+				odMgr := newLiveOrderMgrWithRuntimeDeps(account, callBack, deps)
+				deps.Trading.SetLiveManager(account, odMgr)
+				deps.Trading.SetOrderManager(account, odMgr)
+			} else {
+				mgr.callBack = callBack
+			}
+		}
+		if deps.Orders != nil {
+			state := deps.Orders
+			state.SetEditListener(func(od *ormo.InOutOrder, action string) {
+				if od == nil {
+					return
+				}
+				account := state.GetTaskAcc(od.TaskID)
+				if mgr := GetOdMgrWithState(deps.Trading, account); mgr != nil {
+					mgr.EditOrder(od, action)
+				}
+			})
+		}
+		return
+	}
+	managers := accLiveOdMgrs
+	orderManagers := accOdMgrs
+	accounts := config.Accounts
+	for account, cfg := range accounts {
+		if cfg == nil || cfg.NoTrade {
 			continue
 		}
-		mgr, ok := accLiveOdMgrs[account]
-		if !ok {
-			odMgr := newLiveOrderMgr(account, callBack)
-			accLiveOdMgrs[account] = odMgr
-			accOdMgrs[account] = odMgr
+		mgr, ok := managers[account]
+		if !ok || deps != nil {
+			odMgr := newLiveOrderMgrWithRuntimeDeps(account, callBack, deps)
+			managers[account] = odMgr
+			orderManagers[account] = odMgr
 		} else {
 			mgr.callBack = callBack
 		}
@@ -97,25 +175,193 @@ func InitLiveOrderMgr(callBack func(od *ormo.InOutOrder, isEnter bool)) {
 }
 
 func newLiveOrderMgr(account string, callBack func(od *ormo.InOutOrder, isEnter bool)) *LiveOrderMgr {
+	return newLiveOrderMgrWithRuntimeDeps(account, callBack, nil)
+}
+
+func newLiveOrderMgrWithRuntimeDeps(account string, callBack func(od *ormo.InOutOrder, isEnter bool), deps *RuntimeDeps) *LiveOrderMgr {
 	res := &LiveOrderMgr{
 		OrderMgr: OrderMgr{
 			callBack: callBack,
 			Account:  account,
 		},
+		pairVolMap:    make(map[string]*PairValItem),
+		volPrices:     make(map[string]*VolPrice),
 		queue:         make(chan *OdQItem, 1000),
 		doneKeys:      map[string]int64{},
 		exgIdMap:      map[string]*ormo.InOutOrder{},
 		doneTrades:    map[string]int64{},
 		unMatchTrades: map[string]*banexg.MyTrade{},
 	}
+	if deps != nil {
+		ensureLiveRuntimeDeps(deps)
+		res.OrderMgr.bindRuntimeDeps(*deps)
+		res.coreState = res.runtimeCore
+		if deps.Config != nil {
+			if cfg := deps.Config.View(); cfg != nil {
+				res.orderNamespace = cfg.Name
+			}
+		}
+		res.orderEvents = exg.GetOrderEventCapability(deps.Exchange)
+	} else {
+		res.coreState = nil
+		res.orderNamespace = config.Name
+		res.orderEvents = exg.GetOrderEventCapability(exg.Default)
+	}
 	res.afterEnter = makeAfterEnter(res)
 	res.afterExit = makeAfterExit(res)
 	res.exitByMyOrder = exitByMyOrder(res)
 	res.traceExgOrder = traceExgOrder(res)
-	if exg.AfterCreateOrder == nil {
+	if deps != nil {
+		// The explicit runtime owns its callback. The optional exchange capability
+		// keeps the legacy package hook untouched even when another runtime exists.
+		exg.SetOrderCallback(deps.Exchange, logPutOrderWithDump(deps.Dump))
+	} else if exg.AfterCreateOrder == nil {
 		exg.AfterCreateOrder = logPutOrder
 	}
 	return res
+}
+
+func ensureLiveRuntimeDeps(deps *RuntimeDeps) {
+	if deps == nil {
+		return
+	}
+	requireRuntimeDeps(*deps)
+	if deps.Core.EnvReal && deps.SharedExecution == nil && !execution.IsLegacyExchange(deps.Exchange) {
+		panic("biz: production TS manager requires process-owned legacy sender exchange")
+	}
+}
+
+func (o *LiveOrderMgr) fireOdChange(od *ormo.InOutOrder, evt int) {
+	if o != nil && o.runtimeDeps {
+		if o.walletDeps.Strategies != nil {
+			strat.FireOdChangeWithState(o.walletDeps.Strategies, o.Account, od, evt)
+		}
+		return
+	}
+	strat.FireOdChange(o.Account, od, evt)
+}
+
+func (o *LiveOrderMgr) addTriggerOd(order *ormo.InOutOrder) {
+	if o != nil && o.runtimeDeps {
+		if state := o.orderState(); state != nil {
+			state.AddTriggerOd(o.Account, order)
+		}
+		return
+	}
+	ormo.AddTriggerOd(o.Account, order)
+}
+
+func (o *LiveOrderMgr) saveDirtyODs() *errs.Error {
+	if o != nil && o.runtimeDeps {
+		if state := o.orderState(); state != nil {
+			return state.SaveDirtyODs(orm.DbTrades, o.Account)
+		}
+		return nil
+	}
+	return ormo.SaveDirtyODs(orm.DbTrades, o.Account)
+}
+
+func (o *LiveOrderMgr) done() <-chan struct{} {
+	if o != nil && o.runtimeDeps {
+		if o.coreState != nil {
+			return o.coreState.Done()
+		}
+		return nil
+	}
+	if core.Ctx != nil {
+		return core.Ctx.Done()
+	}
+	return nil
+}
+
+func (o *LiveOrderMgr) sleep(delay time.Duration) bool {
+	if o != nil && o.runtimeDeps {
+		if o.coreState != nil {
+			return o.coreState.Sleep(delay)
+		}
+		time.Sleep(delay)
+		return true
+	}
+	return core.Sleep(delay)
+}
+
+func (o *LiveOrderMgr) workerParentContext() context.Context {
+	if o != nil && o.runtimeDeps && o.coreState != nil {
+		if ctx := o.coreState.Context(); ctx != nil {
+			return ctx
+		}
+	}
+	if ctx := core.Ctx; ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+func (o *LiveOrderMgr) startWorker(parent context.Context, work func(context.Context)) bool {
+	if o == nil || work == nil {
+		return false
+	}
+	o.workerLock.Lock()
+	if o.workerSealed {
+		o.workerLock.Unlock()
+		return false
+	}
+	if o.workerCtx == nil {
+		if parent == nil {
+			parent = o.workerParentContext()
+		}
+		o.workerCtx, o.workerCancel = context.WithCancel(parent)
+	}
+	ctx := o.workerCtx
+	o.workerWait.Add(1)
+	o.workerLock.Unlock()
+	go func() {
+		defer o.workerWait.Done()
+		work(ctx)
+	}()
+	return true
+}
+
+func (o *LiveOrderMgr) setWorkerContext(parent context.Context) bool {
+	if o == nil {
+		return false
+	}
+	o.workerLock.Lock()
+	defer o.workerLock.Unlock()
+	if o.workerSealed {
+		return false
+	}
+	if o.workerCtx == nil {
+		if parent == nil {
+			parent = o.workerParentContext()
+		}
+		o.workerCtx, o.workerCancel = context.WithCancel(parent)
+	}
+	return true
+}
+
+// Stop seals worker admission before publishing cancellation. This keeps a
+// concurrent Start call from adding to the WaitGroup after Join begins.
+func (o *LiveOrderMgr) Stop() {
+	if o == nil {
+		return
+	}
+	o.workerLock.Lock()
+	o.workerSealed = true
+	cancel := o.workerCancel
+	o.workerLock.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// Join stops this manager and waits for every admitted worker.
+func (o *LiveOrderMgr) Join() {
+	if o == nil {
+		return
+	}
+	o.Stop()
+	o.workerWait.Wait()
 }
 
 /*
@@ -125,9 +371,13 @@ SyncLocalOrders 将交易所仓位和本地仓位对比，关闭本地多余仓�
 */
 func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 	// 获取交易所所有持仓
-	posList, err := exg.Default.FetchAccountPositions(nil, map[string]interface{}{
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to sync local orders")
+	}
+	posList, err := exchange.FetchAccountPositions(nil, map[string]interface{}{
 		banexg.ParamAccount:     o.Account,
-		banexg.ParamSettleCoins: config.StakeCurrency,
+		banexg.ParamSettleCoins: o.stakeCurrency(),
 	})
 	if err != nil {
 		return nil, err
@@ -146,8 +396,16 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 		posMap[pos.Symbol][isShort] = pos
 	}
 
+	openOds, lock := o.openOrders()
+	lock.Lock()
+	pendingEntries := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		pendingEntries = append(pendingEntries, od)
+	}
+	lock.Unlock()
+	o.reconcilePendingMarketEntries(pendingEntries)
+
 	// 按symbol分组本地订单
-	openOds, lock := ormo.GetOpenODs(o.Account)
 	lock.Lock()
 	// 过滤重复订单
 	var duplicateOdNum = 0
@@ -169,12 +427,12 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 	}
 	lock.Unlock()
 	if duplicateOdNum > 0 {
-		log.Info("found duplicate orders in global Open orders",
+		o.Logger().Info("found duplicate orders in global Open orders",
 			zap.String("acc", o.Account), zap.Int("num", duplicateOdNum))
 	}
 
 	// 对每个symbol的多空方向进行检查
-	var curMS = btime.UTCStamp()
+	var curMS = o.priceNow()
 	var closedList []*ormo.InOutOrder
 	for symbol, sideOds := range odMap {
 		pos, hasPair := posMap[symbol]
@@ -200,6 +458,26 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 
 			// 如果本地订单量大于实际持仓量,需要关闭部分订单
 			if localAmt > posAmt*1.02 {
+				// A position snapshot can arrive before the private fill stream. Reconcile
+				// submitted exits by their own exchange IDs before using the aggregate
+				// no-match fallback, so a sibling order is never chosen for that fill.
+				changed, pending := o.reconcilePendingExitOrders(curOds)
+				if changed {
+					localAmt = 0
+					for _, od := range curOds {
+						localAmt += od.HoldAmount()
+					}
+				}
+				if localAmt <= posAmt*1.02 {
+					continue
+				}
+				if pending {
+					o.Logger().Warn("defer local position mismatch while exit order is pending",
+						zap.String("acc", o.Account), zap.String("pair", symbol), zap.Bool("short", isShort),
+						zap.Float64("localAmt", localAmt), zap.Float64("exgAmt", posAmt))
+					continue
+				}
+
 				// 按数量降序排序
 				sort.Slice(curOds, func(i, j int) bool {
 					amtI := curOds[i].HoldAmount()
@@ -225,9 +503,9 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 						part = od.CutPart(overAmt, 0)
 					}
 					closeAmt := part.HoldAmount()
-					err = part.LocalExit(0, core.ExitTagNoMatch, 0, "SyncLocalOrders", "")
+					err = o.localExit(part, 0, core.ExitTagNoMatch, 0, "SyncLocalOrders", "")
 					if err != nil {
-						log.Error("force exit order fail", zap.String("acc", o.Account),
+						o.Logger().Error("force exit order fail", zap.String("acc", o.Account),
 							zap.String("key", part.Key()), zap.Error(err))
 						continue
 					}
@@ -235,9 +513,9 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 					overAmt -= closeAmt
 					closeOds = append(closeOds, part.Key())
 					closedList = append(closedList, part)
-					strat.FireOdChange(o.Account, part, strat.OdChgExitFill)
+					o.fireOdChange(part, strat.OdChgExitFill)
 				}
-				log.Warn("close extra local open orders", zap.String("acc", o.Account), zap.String("pair", symbol),
+				o.Logger().Warn("close extra local open orders", zap.String("acc", o.Account), zap.String("pair", symbol),
 					zap.Float64("ExtraTotal", localAmt-posAmt), zap.Float64("ExtraLeft", overAmt),
 					zap.Float64("localAmt", localAmt), zap.Float64("exgAmt", posAmt),
 					zap.Int("odNum", len(closeOds)), zap.Strings("orders", closeOds))
@@ -245,6 +523,71 @@ func (o *LiveOrderMgr) SyncLocalOrders() ([]*ormo.InOutOrder, *errs.Error) {
 		}
 	}
 	return closedList, nil
+}
+
+// reconcilePendingExitOrders refreshes submitted exits by their exchange order IDs.
+// It returns pending=true when an exit cannot yet be authoritatively resolved; callers
+// must then avoid attributing a position delta to another local order.
+func (o *LiveOrderMgr) reconcilePendingExitOrders(ods []*ormo.InOutOrder) (changed, pending bool) {
+	exchange := o.exchangeClient()
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		exit := od.Exit
+		if exit == nil || exit.OrderID == "" || exit.Status == ormo.OdStatusClosed ||
+			od.Status >= ormo.InOutStatusFullExit {
+			lock.Unlock()
+			continue
+		}
+		orderID, symbol, odKey := exit.OrderID, od.Symbol, od.Key()
+		lock.Unlock()
+		if exchange == nil {
+			return changed, true
+		}
+
+		res, err := exchange.FetchOrder(symbol, orderID, map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			pending = true
+			o.Logger().Warn("reconcile pending exit fetch fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if res == nil || res.ID != orderID {
+			pending = true
+			o.Logger().Warn("reconcile pending exit invalid response", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID))
+			continue
+		}
+
+		lock = od.Lock()
+		exit = od.Exit
+		if exit == nil || exit.OrderID != orderID || exit.Status == ormo.OdStatusClosed ||
+			od.Status >= ormo.InOutStatusFullExit {
+			lock.Unlock()
+			continue
+		}
+		beforeFilled, beforeStatus := exit.Filled, od.Status
+		normalized := *res
+		normalized.Timestamp = o.normalizeOrderTimestamp(res, exit.UpdateAt)
+		err = o.updateOdByExgRes(od, false, &normalized)
+		changed = changed || exit.Filled > beforeFilled+AmtDust || od.Status != beforeStatus
+		unresolved := od.Status < ormo.InOutStatusFullExit && exit.Status != ormo.OdStatusClosed
+		lock.Unlock()
+		if err != nil {
+			pending = true
+			o.Logger().Error("reconcile pending exit apply fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if unresolved {
+			pending = true
+		}
+	}
+	return changed, pending
 }
 
 /*
@@ -271,27 +614,62 @@ For redundant positions, treat them as new orders opened by the user and create 
 	     对于冗余的仓位，视为用户开的新订单，创建新订单跟踪。
 */
 func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
-	EnsurePricesLoaded()
-	exchange := exg.Default
-	task := ormo.GetTask(o.Account)
+	completed := false
+	if o.runtimeDeps {
+		if state := o.orderState(); state != nil {
+			state.SetSyncStamp(o.Account, 0)
+		}
+	}
+	defer func() {
+		if !completed && o.runtimeDeps {
+			// A failed reload invalidates any older authority marker. Consumers
+			// must not treat a partially refreshed live view as a snapshot.
+			if state := o.orderState(); state != nil {
+				state.SetSyncStamp(o.Account, 0)
+			}
+		}
+	}()
+	if !o.runtimeDeps {
+		EnsurePricesLoaded()
+	}
+	var task *ormo.BotTask
+	if o.runtimeDeps {
+		if state := o.orderState(); state != nil {
+			task = state.GetTask(o.Account)
+		}
+	} else {
+		task = ormo.GetTask(o.Account)
+	}
+	if task == nil {
+		return nil, nil, nil, errs.NewMsg(core.ErrRunTime, "task is not initialized for account %s", o.Account)
+	}
 	// Get the exchange order
 	// 获取交易所挂单
-	exOdList, err := exchange.FetchOpenOrders("", task.CreateAt, 1000, map[string]interface{}{
-		banexg.ParamAccount:     o.Account,
-		banexg.ParamSettleCoins: config.StakeCurrency,
-	})
+	exOdList, err := o.fetchAccountOpenOrders(o.Account, task.CreateAt)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return nil, nil, nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required to sync exchange orders")
 	}
 	exgOdMap := make(map[string]*banexg.Order)
 	for _, od := range exOdList {
 		exgOdMap[od.ID] = od
 	}
-	orders, pairLastTfs, err := loadOpenOrders(task.ID, o.Account)
+	orders, pairLastTfs, err := loadOpenOrders(task.ID, o.Account, o.takeOverStrategy(), o.orderState())
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	openOds, lock := ormo.GetOpenODs(o.Account)
+	if state := o.orderState(); state != nil {
+		for _, order := range orders {
+			if order != nil {
+				order.BindState(state)
+			}
+		}
+	}
+	o.restoreExchangeTriggers(orders, exOdList)
+	openOds, lock := o.openOrders()
 	var lastOrderMS int64
 	var openPairs = map[string]struct{}{}
 	var delOds, saveOds []*ormo.InOutOrder
@@ -308,7 +686,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		}
 		err = o.restoreInOutOrder(od, exgOdMap)
 		if err != nil {
-			log.Error("restoreInOutOrder fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
+			o.Logger().Error("restoreInOutOrder fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
 			if err.Data == restoreAmbiguousExgData {
 				return nil, nil, nil, err
 			}
@@ -322,20 +700,27 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		saveOds = append(saveOds, od)
 	}
 	if len(delOds) > 0 || len(saveOds) > 0 {
-		delSaveOrders(o.Account, delOds, saveOds)
+		delSaveOrders(o.Account, delOds, saveOds, o.orderState())
 	}
-	if !banexg.IsContract(core.Market) {
+	if !o.isContract() {
 		// 非合约市场，无法获取仓位，直接返回
 		lock.Lock()
 		oldList := utils2.ValsOfMap(openOds)
 		lock.Unlock()
+		o.markSyncComplete()
+		completed = true
 		return oldList, nil, nil, nil
+	}
+	historySince := exchangeOrderHistorySince(o.priceNow(), lastOrderMS)
+	recentClosed, err := loadRecentClosedOrders(task.ID, historySince, o.orderState())
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	// Get exchange positions
 	// 获取交易所仓位
 	posList, err := exchange.FetchAccountPositions(nil, map[string]interface{}{
 		banexg.ParamAccount:     o.Account,
-		banexg.ParamSettleCoins: config.StakeCurrency,
+		banexg.ParamSettleCoins: o.stakeCurrency(),
 	})
 	if err != nil {
 		return nil, nil, nil, err
@@ -369,7 +754,7 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 			}
 		}
 		prevTF, _ := pairLastTfs[pair]
-		err = o.syncPairOrders(pair, prevTF, longPos, shortPos, lastOrderMS, curOds)
+		err = o.syncPairOrders(pair, prevTF, longPos, shortPos, historySince, curOds, recentClosed)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -404,20 +789,70 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	}
 	lock.Unlock()
 	if len(oldList) > 0 {
-		log.Info(fmt.Sprintf("%s: Restore %v open orders", o.Account, len(oldList)))
+		o.Logger().Info(fmt.Sprintf("%s: Restore %v open orders", o.Account, len(oldList)))
 	}
 	if len(newList) > 0 {
-		log.Info(fmt.Sprintf("%s: Started tracking %v users' orders", o.Account, len(newList)))
+		o.Logger().Info(fmt.Sprintf("%s: Started tracking %v users' orders", o.Account, len(newList)))
 	}
-	err = ormo.SaveDirtyODs(orm.DbTrades, o.Account)
+	o.healMissingFullEnterTriggers(resOdList, exOdList)
+	err = o.saveDirtyODs()
 	if err != nil {
-		log.Error("SaveDirtyODs fail", zap.String("acc", o.Account), zap.Error(err))
+		o.Logger().Error("SaveDirtyODs fail", zap.String("acc", o.Account), zap.Error(err))
 	}
+	o.markSyncComplete()
+	completed = true
 	return oldList, newList, delList, nil
 }
 
-func loadOpenOrders(taskID int64, account string) ([]*ormo.InOutOrder, map[string]string, *errs.Error) {
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+// markSyncComplete publishes authority only after the full exchange reload
+// completed without a fatal error. Failed or partial reloads leave any prior
+// marker untouched so strategy snapshots never become newly authoritative.
+func (o *LiveOrderMgr) markSyncComplete() {
+	if state := o.orderState(); state != nil {
+		state.SetSyncStamp(o.Account, o.priceNow())
+	}
+}
+
+func fetchAccountOpenOrders(account string, since int64) ([]*banexg.Order, *errs.Error) {
+	return exg.Default.FetchOpenOrders("", since, openOrderSnapshotLimit, map[string]interface{}{
+		banexg.ParamAccount:      account,
+		banexg.ParamSettleCoins:  config.StakeCurrency,
+		banexg.ParamFullSnapshot: true,
+	})
+}
+
+func (o *LiveOrderMgr) fetchAccountOpenOrders(account string, since int64) ([]*banexg.Order, *errs.Error) {
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "exchange is required to fetch open orders")
+	}
+	return exchange.FetchOpenOrders("", since, openOrderSnapshotLimit, map[string]interface{}{
+		banexg.ParamAccount:      account,
+		banexg.ParamSettleCoins:  o.stakeCurrency(),
+		banexg.ParamFullSnapshot: true,
+	})
+}
+
+func exchangeOrderHistorySince(curMS, lastOrderMS int64) int64 {
+	monthMS := int64(utils2.TFToSecs("1M") * 1000)
+	return max(lastOrderMS, curMS-monthMS)
+}
+
+func loadRecentClosedOrders(taskID, sinceMS int64, states ...*ormo.OrderState) ([]*ormo.InOutOrder, *errs.Error) {
+	sess, conn, err := orderStorageState(states).Conn(false)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return sess.GetOrders(ormo.GetOrdersArgs{
+		TaskID:     taskID,
+		Status:     2,
+		CloseAfter: sinceMS,
+	})
+}
+
+func loadOpenOrders(taskID int64, account, takeOverStrategy string, states ...*ormo.OrderState) ([]*ormo.InOutOrder, map[string]string, *errs.Error) {
+	sess, conn, err := orderStorageState(states).Conn(true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -439,8 +874,8 @@ func loadOpenOrders(taskID int64, account string) ([]*ormo.InOutOrder, map[strin
 	// Query the most recent usage time period of a task
 	// 查询任务的最近使用时间周期
 	var pairLastTfs = make(map[string]string)
-	if config.TakeOverStrat != "" {
-		pairLastTfs, err = sess.GetHistOrderTfs(taskID, config.TakeOverStrat)
+	if takeOverStrategy != "" {
+		pairLastTfs, err = sess.GetHistOrderTfs(taskID, takeOverStrategy)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -448,8 +883,15 @@ func loadOpenOrders(taskID int64, account string) ([]*ormo.InOutOrder, map[strin
 	return orders, pairLastTfs, nil
 }
 
-func delSaveOrders(account string, delOds, saves []*ormo.InOutOrder) {
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+func orderStorageState(states []*ormo.OrderState) *ormo.OrderState {
+	if len(states) > 0 {
+		return states[0]
+	}
+	return nil
+}
+
+func delSaveOrders(account string, delOds, saves []*ormo.InOutOrder, states ...*ormo.OrderState) {
+	sess, conn, err := orderStorageState(states).Conn(true)
 	if err != nil {
 		log.Warn("get conn fail", zap.Error(err))
 		return
@@ -490,7 +932,7 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 	if tryOd.Enter && tryOd.OrderID == "" && tryOd.Status == ormo.OdStatusInit {
 		var clientMatches []*banexg.Order
 		for _, exOd := range exgOdMap {
-			if exOd.Symbol == od.Symbol && exOd.Side == od.Enter.Side && getClientOrderId(exOd.ClientOrderID) == od.ID {
+			if exOd.Symbol == od.Symbol && exOd.Side == od.Enter.Side && o.getClientOrderID(exOd.ClientOrderID) == od.ID {
 				clientMatches = append(clientMatches, exOd)
 			}
 		}
@@ -508,10 +950,10 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 			// Market data is usually still cold during startup. Re-register persisted
 			// virtual entries and let VerifyTriggerOds evaluate them once data is ready.
 			od.SetInfo(odInfoLocalTrigger, int64(1))
-			ormo.AddTriggerOd(o.Account, od)
+			o.addTriggerOd(od)
 		} else {
-			err = od.LocalExit(0, core.ExitTagForceExit, od.InitPrice, "Restart and cancel orders that haven't been filled", "")
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			err = o.localExit(od, 0, core.ExitTagForceExit, od.InitPrice, "Restart and cancel orders that haven't been filled", "")
+			o.fireOdChange(od, strat.OdChgExitFill)
 			return err
 		}
 	} else if tryOd.OrderID != "" && tryOd.Status != ormo.OdStatusClosed {
@@ -521,7 +963,11 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 		if !ok {
 			// The order has been cancelled or completed. Check the exchange order
 			// 订单已取消或已成交，查询交易所订单
-			exOd, err = exg.Default.FetchOrder(od.Symbol, tryOd.OrderID, map[string]interface{}{
+			exchange := o.exchangeClient()
+			if exchange == nil {
+				return errs.NewMsg(core.ErrExgNotInit, "exchange is required to restore order %s", od.Key())
+			}
+			exOd, err = exchange.FetchOrder(od.Symbol, tryOd.OrderID, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
 			})
 			if err != nil && err.Code != errs.CodeOrderNotFound {
@@ -556,12 +1002,12 @@ func (o *LiveOrderMgr) restoreInOutOrder(od *ormo.InOutOrder, exgOdMap map[strin
 		if tryOd.Status == ormo.OdStatusClosed {
 			od.Status = ormo.InOutStatusFullExit
 			od.DirtyMain = true
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			o.fireOdChange(od, strat.OdChgExitFill)
 			return nil
 		} else if tryOd.Status > ormo.OdStatusInit {
 			// You shouldn't go here.
 			// 这里不应该走到
-			log.Error("Exit Status Invalid", zap.String("acc", o.Account), zap.String("key", od.Key()),
+			o.Logger().Error("Exit Status Invalid", zap.String("acc", o.Account), zap.String("key", od.Key()),
 				zap.Int64("sta", tryOd.Status), zap.String("orderId", tryOd.OrderID))
 		} else {
 			// Here OrderID must be empty, and the number of entry orders must be filled.
@@ -581,16 +1027,18 @@ For the specified currency, synchronize the exchange order status to the local m
 sinceMS是本地记录的已处理交易所最新订单时间戳，只获取此后的订单，同步状态到本地。
 */
 func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *banexg.Position, sinceMS int64,
-	openOds map[int64]*ormo.InOutOrder) *errs.Error {
+	openOds map[int64]*ormo.InOutOrder, recentClosed []*ormo.InOutOrder) *errs.Error {
 	var exOrders []*banexg.Order
 	var err *errs.Error
-	var curMS = btime.UTCStamp()
+	var curMS = o.priceNow()
 	// Get exchange order history and try to restore the order status.
 	// 从交易所获取订单记录，尝试恢复订单状态。
 	// 这里必须指定sinceMS，避免获取过早的订单创建冗余本地记录
-	monMSecs := int64(utils2.TFToSecs("1M") * 1000)
-	minSince := curMS - monMSecs
-	exOrders, err = exg.Default.FetchOrders(pair, max(sinceMS, minSince), 300, map[string]interface{}{
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to sync pair orders")
+	}
+	exOrders, err = exchange.FetchOrders(pair, sinceMS, 300, map[string]interface{}{
 		banexg.ParamAccount:   o.Account,
 		banexg.ParamUntil:     curMS,
 		banexg.ParamLoopIntv:  int64(utils2.TFToSecs("7d") * 1000),
@@ -608,22 +1056,14 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 		shortPosAmt = shortPos.Contracts
 	}
 	if len(openOds) > 0 {
-		exIdMap := make(map[string]*ormo.InOutOrder)
-		for _, iod := range openOds {
-			if iod.Enter != nil && iod.Enter.OrderID != "" {
-				exIdMap[iod.Enter.OrderID] = iod
-			}
-			if iod.Exit != nil && iod.Exit.OrderID != "" {
-				exIdMap[iod.Exit.OrderID] = iod
-			}
-		}
+		knownOds, exIdMap := indexHistoricalOrders(pair, recentClosed, openOds)
 		for _, exod := range exOrders {
 			if !banexg.IsOrderDone(exod.Status) {
 				// Skip uncompleted orders
 				// 跳过未完成订单
 				continue
 			}
-			err = o.applyHisOrder(openOds, exIdMap, exod, defTF)
+			err = o.applyHisOrder(openOds, knownOds, exIdMap, exod, defTF)
 			if err != nil {
 				return err
 			}
@@ -640,8 +1080,8 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 					// Not submitted to the exchange yet, cancel directly
 					// 尚未提交到交易所，直接取消
 					msg := "Cancel unsubmitted orders"
-					err = iod.LocalExit(0, core.ExitTagCancel, iod.Enter.Price, msg, "")
-					strat.FireOdChange(o.Account, iod, strat.OdChgExitFill)
+					err = o.localExit(iod, 0, core.ExitTagCancel, iod.Enter.Price, msg, "")
+					o.fireOdChange(iod, strat.OdChgExitFill)
 					if err != nil {
 						return err
 					}
@@ -654,8 +1094,8 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 				// TODO: 这里计算的quote价值，后续需要改为法币价值
 				if iod.Status < ormo.InOutStatusFullExit {
 					msg := "The order has no corresponding position"
-					err = iod.LocalExit(0, core.ExitTagFatalErr, iod.InitPrice, msg, "")
-					strat.FireOdChange(o.Account, iod, strat.OdChgExitFill)
+					err = o.localExit(iod, 0, core.ExitTagFatalErr, iod.InitPrice, msg, "")
+					o.fireOdChange(iod, strat.OdChgExitFill)
 					if err != nil {
 						return err
 					}
@@ -673,31 +1113,31 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 			}
 			if fillAmt < odAmt*0.01 {
 				msg := fmt.Sprintf("no corresponding position in the exchange")
-				err = iod.LocalExit(0, core.ExitTagFatalErr, iod.InitPrice, msg, "")
-				strat.FireOdChange(o.Account, iod, strat.OdChgExitFill)
+				err = o.localExit(iod, 0, core.ExitTagFatalErr, iod.InitPrice, msg, "")
+				o.fireOdChange(iod, strat.OdChgExitFill)
 				if err != nil {
 					return err
 				}
 				delete(openOds, iod.ID)
 			} else if fillAmt < odAmt*0.99 {
-				price := com.GetPriceSafe(pair, "")
+				price := o.priceSafeExp(pair, "", com.Day10MSecs)
 				if price == -1 {
-					log.Warn("price not available, skip position mismatch check", zap.String("pair", pair))
+					o.Logger().Warn("price not available, skip position mismatch check", zap.String("pair", pair))
 					continue
 				}
 				holdCost := odAmt * price
 				fillPct := math.Round(fillAmt * 100 / odAmt)
-				log.Error("position not match", zap.String("acc", o.Account),
+				o.Logger().Error("position not match", zap.String("acc", o.Account),
 					zap.String("pair", pair), zap.String("key", iod.Key()),
 					zap.Float64("holdCost", holdCost), zap.Float64("fillPct", fillPct))
 			}
 		}
 	}
-	if config.TakeOverStrat == "" {
+	if o.takeOverStrategy() == "" {
 		if longPosAmt > AmtDust || shortPosAmt > AmtDust {
-			price := com.GetPriceSafe(pair, "")
+			price := o.priceSafeExp(pair, "", com.Day10MSecs)
 			if price == -1 {
-				log.Warn("price not available, skip unknown position check", zap.String("pair", pair))
+				o.Logger().Warn("price not available, skip unknown position check", zap.String("pair", pair))
 				return nil
 			}
 			longCost := math.Round(longPosAmt*price*100) / 100
@@ -709,7 +1149,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 						longOds = append(longOds, od.Key())
 					}
 				}
-				log.Error("unknown long position", zap.String("acc", o.Account), zap.String("pair", pair),
+				o.Logger().Error("unknown long position", zap.String("acc", o.Account), zap.String("pair", pair),
 					zap.Float64("longAmt", longPosAmt), zap.Strings("local", longOds))
 			}
 			if shortCost > 1 {
@@ -719,7 +1159,7 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 						shortOds = append(shortOds, od.Key())
 					}
 				}
-				log.Error("unknown short position", zap.String("acc", o.Account), zap.String("pair", pair),
+				o.Logger().Error("unknown short position", zap.String("acc", o.Account), zap.String("pair", pair),
 					zap.Float64("shortAmt", shortPosAmt), zap.Strings("local", shortOds))
 			}
 		}
@@ -752,6 +1192,58 @@ func (o *LiveOrderMgr) syncPairOrders(pair, defTF string, longPos, shortPos *ban
 	return nil
 }
 
+func indexHistoricalOrders(pair string, recentClosed []*ormo.InOutOrder,
+	openOds map[int64]*ormo.InOutOrder) (map[int64]*ormo.InOutOrder, map[string]*ormo.InOutOrder) {
+	knownOds := make(map[int64]*ormo.InOutOrder, len(recentClosed)+len(openOds))
+	// A present nil value blocks ambiguous IDs from reaching heuristic matching.
+	exIDMap := make(map[string]*ormo.InOutOrder)
+	for _, od := range recentClosed {
+		if od == nil || od.Symbol != pair {
+			continue
+		}
+		knownOds[od.ID] = od
+		indexHistoricalExchangeIDs(exIDMap, od)
+	}
+	openExIDs := make(map[string]*ormo.InOutOrder)
+	for _, od := range openOds {
+		if od == nil || od.Symbol != pair {
+			continue
+		}
+		knownOds[od.ID] = od
+		indexHistoricalExchangeIDs(openExIDs, od)
+	}
+	for id, od := range openExIDs {
+		exIDMap[id] = od
+	}
+	return knownOds, exIDMap
+}
+
+func indexHistoricalExchangeIDs(dst map[string]*ormo.InOutOrder, od *ormo.InOutOrder) {
+	ids := make([]string, 0, 5)
+	for _, sub := range []*ormo.ExOrder{od.Enter, od.Exit} {
+		if sub != nil {
+			ids = append(ids, sub.OrderID)
+		}
+	}
+	for _, trigger := range []*ormo.TriggerState{od.GetStopLoss(), od.GetTakeProfit()} {
+		if trigger != nil {
+			ids = append(ids, trigger.OrderId)
+		}
+	}
+	ids = append(ids, od.GetInfoString(ormo.OdInfoTrailingID))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		current, exists := dst[id]
+		if exists && current != od {
+			dst[id] = nil
+		} else if !exists {
+			dst[id] = od
+		}
+	}
+}
+
 func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price float64) (string, float64, float64) {
 	isMaker := false
 	if fee != nil {
@@ -770,23 +1262,45 @@ func getFeeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price fl
 	return fee.Currency, fee.Cost, fee.QuoteCost
 }
 
-func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
+func (o *LiveOrderMgr) feeNameCost(fee *banexg.Fee, pair, odType, side string, amount, price float64) (string, float64, float64) {
+	if !o.runtimeDeps {
+		return getFeeNameCost(fee, pair, odType, side, amount, price)
+	}
+	if fee != nil && fee.Cost > 0 {
+		return fee.Currency, fee.Cost, fee.QuoteCost
+	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return "", 0, 0
+	}
+	isMaker := fee != nil && fee.IsMaker || fee == nil && odType != banexg.OdTypeMarket
+	fee, err := exchange.CalculateFee(pair, odType, side, amount, price, isMaker, nil)
+	if err != nil || fee == nil {
+		if err != nil {
+			o.Logger().Error("calc fee fail feeNameCost", zap.Error(err))
+		}
+		return "", 0, 0
+	}
+	return fee.Currency, fee.Cost, fee.QuoteCost
+}
+
+func (o *LiveOrderMgr) applyHisOrder(openOds, knownOds map[int64]*ormo.InOutOrder,
+	exIdMap map[string]*ormo.InOutOrder, od *banexg.Order, defTF string) *errs.Error {
 	if od.Filled == 0 {
 		return nil
 	}
 	isShort := od.PositionSide == banexg.PosSideShort
 	isSell := od.Side == banexg.OdSideSell
-	exs, err := orm.GetExSymbolCur(od.Symbol)
-	if err != nil {
-		return err
-	}
-	feeName, feeCost, feeQuote := getFeeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Filled, od.Average)
-	price, amount, odTime := od.Average, od.Filled, od.Timestamp
-	defTF = config.GetTakeOverTF(od.Symbol, defTF)
 
 	var inOut *ormo.InOutOrder
 	var exOd *ormo.ExOrder
+	var err *errs.Error
 	if iod, ok := exIdMap[od.ID]; ok {
+		if iod == nil {
+			o.Logger().Warn("skip ambiguous historical exchange order", zap.String("acc", o.Account),
+				zap.String("pair", od.Symbol), zap.String("orderId", od.ID))
+			return nil
+		}
 		// 通过订单id直接匹配
 		if iod.Enter != nil && iod.Enter.OrderID == od.ID {
 			exOd = iod.Enter
@@ -797,9 +1311,9 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 	}
 	if exOd == nil {
 		// 通过ClientOrderID解析目标订单
-		iodID := getClientOrderId(od.ClientOrderID)
+		iodID := o.getClientOrderID(od.ClientOrderID)
 		if iodID > 0 {
-			if iod, ok := ods[iodID]; ok {
+			if iod, ok := knownOds[iodID]; ok {
 				if isShort == isSell {
 					exOd = iod.Enter
 				} else {
@@ -809,6 +1323,8 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 			}
 		}
 	}
+	feeName, feeCost, feeQuote := o.feeNameCost(od.Fee, od.Symbol, od.Type, od.Side, od.Filled, od.Average)
+	price, amount, odTime := od.Average, od.Filled, od.Timestamp
 	if exOd != nil {
 		if exOd.Enter {
 			inOut.SetInfo(odInfoLocalTrigger, nil)
@@ -844,18 +1360,39 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		}
 		return nil
 	}
+	if inOut != nil {
+		if isShort == isSell {
+			o.Logger().Warn("skip historical entry with incomplete local identity", zap.String("acc", o.Account),
+				zap.String("pair", od.Symbol), zap.String("orderId", od.ID), zap.Int64("localId", inOut.ID))
+			return nil
+		}
+		return o.updateByMyTrade(inOut, &banexg.MyTrade{
+			Trade: banexg.Trade{
+				ID: od.ID, Symbol: od.Symbol, Side: od.Side, Type: od.Type, Amount: od.Amount,
+				Price: od.Average, Order: od.ID, Timestamp: od.Timestamp,
+				Fee: &banexg.Fee{Currency: feeName, Cost: feeCost, QuoteCost: feeQuote},
+			},
+			Filled: od.Filled, ClientID: od.ClientOrderID, Average: od.Average,
+			State: od.Status, PosSide: od.PositionSide, ReduceOnly: od.ReduceOnly,
+		})
+	}
+	exs, err := o.exSymbolCur(od.Symbol)
+	if err != nil {
+		return err
+	}
+	defTF = o.takeOverTF(od.Symbol, defTF)
 	if isShort == isSell {
 		// Open long or short 开多或开空
 		if defTF == "" {
-			log.Warn("take over job not found", zap.String("acc", o.Account),
-				zap.String("pair", od.Symbol), zap.String("strat", config.TakeOverStrat))
+			o.Logger().Warn("take over job not found", zap.String("acc", o.Account),
+				zap.String("pair", od.Symbol), zap.String("strat", o.takeOverStrategy()))
 			return nil
 		}
 		tag := "[LONG]"
 		if isShort {
 			tag = "[SHORT]"
 		}
-		log.Info(fmt.Sprintf("%s %s: price:%.5f, amount: %.5f, %v, fee: %.5f, %v id:%v",
+		o.Logger().Info(fmt.Sprintf("%s %s: price:%.5f, amount: %.5f, %v, fee: %.5f, %v id:%v",
 			o.Account, tag, price, amount, od.Type, feeCost, odTime, od.ID))
 		iod := o.createInOutOd(exs, isShort, price, amount, od.Type, feeCost, feeQuote, feeName, odTime, ormo.OdStatusClosed,
 			od.ID, defTF)
@@ -863,12 +1400,12 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		if err != nil {
 			return err
 		}
-		ods[iod.ID] = iod
+		openOds[iod.ID] = iod
 	} else {
 		// Close long or short 平多或平空
 		var part *ormo.InOutOrder
 		var feeLeft float64
-		for _, iod := range ods {
+		for _, iod := range openOds {
 			if iod.Short != isShort || iod.RealEnterMS() > odTime {
 				continue
 			}
@@ -883,7 +1420,7 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 			if isShort {
 				tag = "Close Short"
 			}
-			log.Info(fmt.Sprintf("%s %v: price:%.5f, amount: %.5f, %v, %v id: %v",
+			o.Logger().Info(fmt.Sprintf("%s %v: price:%.5f, amount: %.5f, %v, %v id: %v",
 				o.Account, tag, price, part.Exit.Filled, od.Type, odTime, od.ID))
 			if iod.Status < ormo.InOutStatusFullExit {
 				err = iod.Save()
@@ -898,15 +1435,15 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 		if !od.ReduceOnly && amount > AmtDust {
 			// Remaining quantity, create opposite order 剩余数量，创建相反订单
 			if defTF == "" {
-				log.Warn("take over job not found", zap.String("acc", o.Account),
-					zap.String("pair", od.Symbol), zap.String("stagy", config.TakeOverStrat))
+				o.Logger().Warn("take over job not found", zap.String("acc", o.Account),
+					zap.String("pair", od.Symbol), zap.String("stagy", o.takeOverStrategy()))
 				return nil
 			}
 			tag := "[long]"
 			if isShort {
 				tag = "[short]"
 			}
-			log.Info(fmt.Sprintf("%s %v: price:%.5f, amount: %.5f, %v, fee: %.5f %v id: %v",
+			o.Logger().Info(fmt.Sprintf("%s %v: price:%.5f, amount: %.5f, %v, fee: %.5f %v id: %v",
 				o.Account, tag, price, amount, od.Type, feeCost, odTime, od.ID))
 			iod := o.createInOutOd(exs, isShort, price, amount, od.Type, feeCost, feeQuote, feeName, odTime, ormo.OdStatusClosed,
 				od.ID, defTF)
@@ -914,7 +1451,7 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 			if err != nil {
 				return err
 			}
-			ods[iod.ID] = iod
+			openOds[iod.ID] = iod
 		}
 	}
 	return nil
@@ -923,20 +1460,28 @@ func (o *LiveOrderMgr) applyHisOrder(ods map[int64]*ormo.InOutOrder, exIdMap map
 func (o *LiveOrderMgr) createInOutOd(exs *orm.ExSymbol, short bool, average, filled float64, odType string,
 	feeCost float64, feeQuote float64, feeName string, enterAt int64, entStatus int, entOdId string, defTF string) *ormo.InOutOrder {
 	notional := average * filled
-	leverage, _ := exg.GetLeverage(exs.Symbol, notional, o.Account)
+	var leverage float64
+	if exchange := o.exchangeClient(); exchange != nil {
+		leverage, _ = exchange.GetLeverage(exs.Symbol, notional, o.Account)
+	}
 	if leverage == 0 {
-		leverage = config.GetAccLeverage(o.Account)
+		leverage = o.accountLeverage()
 	}
 	status := ormo.InOutStatusPartEnter
 	if entStatus == ormo.OdStatusClosed {
 		status = ormo.InOutStatusFullEnter
 	}
-	stgVer, _ := strat.Versions[config.TakeOverStrat]
+	stgVer := 0
+	if o.runtimeDeps && o.walletDeps.Strategies != nil {
+		stgVer, _ = o.walletDeps.Strategies.Version(o.takeOverStrategy())
+	} else {
+		stgVer, _ = strat.GetVersion(o.takeOverStrategy())
+	}
 	entSide := banexg.OdSideBuy
 	if short {
 		entSide = banexg.OdSideSell
 	}
-	taskId := ormo.GetTaskID(o.Account)
+	taskId := o.taskID()
 	od := &ormo.InOutOrder{
 		IOrder: &ormo.IOrder{
 			TaskID:    taskId,
@@ -950,7 +1495,7 @@ func (o *LiveOrderMgr) createInOutOd(exs *orm.ExSymbol, short bool, average, fil
 			QuoteCost: notional * leverage,
 			Leverage:  leverage,
 			EnterAt:   enterAt,
-			Strategy:  config.TakeOverStrat,
+			Strategy:  o.takeOverStrategy(),
 			StgVer:    int64(stgVer),
 		},
 		Enter: &ormo.ExOrder{
@@ -974,33 +1519,36 @@ func (o *LiveOrderMgr) createInOutOd(exs *orm.ExSymbol, short bool, average, fil
 		DirtyMain:  true,
 		DirtyEnter: true,
 	}
+	if state := o.orderState(); state != nil {
+		od.BindState(state)
+	}
 	if status >= ormo.InOutStatusFullEnter {
-		strat.FireOdChange(o.Account, od, strat.OdChgEnterFill)
+		o.fireOdChange(od, strat.OdChgEnterFill)
 	} else {
-		strat.FireOdChange(o.Account, od, strat.OdChgEnter)
+		o.fireOdChange(od, strat.OdChgEnter)
 	}
 	return od
 }
 
 func (o *LiveOrderMgr) createOdFromPos(pos *banexg.Position, defTF string) (*ormo.InOutOrder, *errs.Error) {
 	if defTF == "" {
-		return nil, errs.NewMsg(core.ErrBadConfig, "take over job not found, %s %s", pos.Symbol, config.TakeOverStrat)
+		return nil, errs.NewMsg(core.ErrBadConfig, "take over job not found, %s %s", pos.Symbol, o.takeOverStrategy())
 	}
-	exs, err := orm.GetExSymbolCur(pos.Symbol)
+	exs, err := o.exSymbolCur(pos.Symbol)
 	if err != nil {
 		return nil, err
 	}
-	average, filled, entOdType := pos.EntryPrice, pos.Contracts, config.OrderType
+	average, filled, entOdType := pos.EntryPrice, pos.Contracts, o.orderType()
 	isShort := pos.Side == banexg.PosSideShort
 	// There is no handling fee for position information. The handling fee is inferred directly from the current robot order type, which may be different from the actual handling fee.
 	//持仓信息没有手续费，直接从当前机器人订单类型推断手续费，可能和实际的手续费不同
-	feeName, feeCost, feeQuote := getFeeNameCost(nil, pos.Symbol, "", pos.Side, pos.Contracts, pos.EntryPrice)
+	feeName, feeCost, feeQuote := o.feeNameCost(nil, pos.Symbol, "", pos.Side, pos.Contracts, pos.EntryPrice)
 	tag := "LONG"
 	if isShort {
 		tag = "SHORT"
 	}
-	log.Info(fmt.Sprintf("%s [Pos]%v: price:%.5f, amount:%.5f, fee: %.5f", o.Account, tag, average, filled, feeCost))
-	enterAt := btime.TimeMS()
+	o.Logger().Info(fmt.Sprintf("%s [Pos]%v: price:%.5f, amount:%.5f, fee: %.5f", o.Account, tag, average, filled, feeCost))
+	enterAt := o.priceNow()
 	entStatus := ormo.OdStatusClosed
 	iod := o.createInOutOd(exs, isShort, average, filled, entOdType, feeCost, feeQuote, feeName, enterAt, entStatus, "", defTF)
 	return iod, nil
@@ -1015,10 +1563,10 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 	feeName string, feeCost float64, feeQuote float64) (float64, float64, *ormo.InOutOrder) {
 	orgFeeCost := feeCost
 	if iod.Enter.Filled == 0 {
-		err := iod.LocalExit(0, core.ExitTagForceExit, iod.InitPrice, "not entered", "")
-		strat.FireOdChange(o.Account, iod, strat.OdChgExitFill)
+		err := o.localExit(iod, 0, core.ExitTagForceExit, iod.InitPrice, "not entered", "")
+		o.fireOdChange(iod, strat.OdChgExitFill)
 		if err != nil {
-			log.Error("local exit no enter order fail", zap.String("acc", o.Account),
+			o.Logger().Error("local exit no enter order fail", zap.String("acc", o.Account),
 				zap.String("key", iod.Key()), zap.Error(err))
 		}
 		return filled, feeCost / orgFeeCost, iod
@@ -1050,7 +1598,7 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 		if part.Short {
 			exitSide = banexg.OdSideBuy
 		}
-		taskId := ormo.GetTaskID(o.Account)
+		taskId := o.taskID()
 		part.Exit = &ormo.ExOrder{
 			TaskID:    taskId,
 			InoutID:   part.ID,
@@ -1087,16 +1635,19 @@ func (o *LiveOrderMgr) tryFillExit(iod *ormo.InOutOrder, filled, price float64, 
 	part.ExitAt = odTime
 	part.Status = ormo.InOutStatusFullExit
 	part.DirtyMain = true
-	strat.FireOdChange(o.Account, part, strat.OdChgExitFill)
+	o.fireOdChange(part, strat.OdChgExitFill)
 	return filled, feeCost / orgFeeCost, part
 }
 
 func (o *LiveOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error) {
-	if len(job.Entrys) == 0 && len(job.Exits) == 0 {
+	if job == nil {
 		return nil, nil, nil
 	}
-	log.Info("ProcessOrders", zap.String("acc", o.Account), zap.String("pair", job.Symbol.Symbol),
-		zap.Any("enters", job.Entrys), zap.Any("exits", job.Exits))
+	snapshot := job.ExecutionSnapshot()
+	if len(snapshot.Entrys) > 0 || len(snapshot.Exits) > 0 {
+		o.Logger().Info("ProcessOrders", zap.String("acc", o.Account), zap.String("pair", job.Symbol.Symbol),
+			zap.Any("enters", snapshot.Entrys), zap.Any("exits", snapshot.Exits))
+	}
 	return o.OrderMgr.ProcessOrders(job)
 }
 
@@ -1105,7 +1656,7 @@ func (o *LiveOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.
 		return err
 	}
 	// Enforce StopBars for submitted limit entry orders in live mode.
-	curMS := btime.TimeMS()
+	curMS := o.priceNow()
 	for _, od := range allOpens {
 		if od.Status > ormo.InOutStatusInit || od.Enter == nil || od.Enter.Price == 0 {
 			continue
@@ -1126,14 +1677,14 @@ func (o *LiveOrderMgr) UpdateByDataSeries(allOpens []*ormo.InOutOrder, evt *orm.
 }
 
 func (o *LiveOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
-	if isFarEnter(od) {
+	if o.isFarEnter(od) {
 		od.SetInfo(odInfoLocalTrigger, int64(1))
 		if err := od.Save(); err != nil {
-			log.Error("save local trigger order fail", zap.String("acc", o.Account),
+			o.Logger().Error("save local trigger order fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
 			return
 		}
-		ormo.AddTriggerOd(o.Account, od)
+		o.addTriggerOd(od)
 	} else {
 		o.queue <- &OdQItem{
 			Order:  od,
@@ -1145,14 +1696,14 @@ func (o *LiveOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
 func makeAfterEnter(o *LiveOrderMgr) FuncHandleIOrder {
 	return func(order *ormo.InOutOrder) *errs.Error {
 		fields := []zap.Field{zap.String("acc", o.Account), zap.String("key", order.Key())}
-		if isFarEnter(order) {
+		if o.isFarEnter(order) {
 			// Limit orders that are difficult to execute for a long time will not be submitted to the exchange to prevent funds from being occupied.
 			// 长时间难以成交的限价单，先不提交到交易所，防止资金占用
 			order.SetInfo(odInfoLocalTrigger, int64(1))
 			if err := order.Save(); err != nil {
 				return err
 			}
-			ormo.AddTriggerOd(o.Account, order)
+			o.addTriggerOd(order)
 			log.Info("NEW Enter trigger", fields...)
 			return nil
 		}
@@ -1191,30 +1742,34 @@ func (o *LiveOrderMgr) ConsumeOrderQueue() {
 	if !atomic.CompareAndSwapInt32(&o.isConsumeOrderQ, 0, 1) {
 		return
 	}
-	go func() {
+	if !o.startWorker(nil, func(ctx context.Context) {
 		defer func() {
 			atomic.StoreInt32(&o.isConsumeOrderQ, 0)
 		}()
 		for {
 			var item *OdQItem
 			select {
-			case <-core.Ctx.Done():
+			case <-ctx.Done():
 				return
 			case item = <-o.queue:
-				break
+				if item == nil {
+					continue
+				}
 			}
 			o.handleOrderQueue(item.Order, item.Action)
 		}
-	}()
+	}) {
+		atomic.StoreInt32(&o.isConsumeOrderQ, 0)
+	}
 }
 
 func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
-	err := com.EnsureLatestPrice(od.Symbol)
+	err := o.ensureLatestPrice(od.Symbol)
 	if err != nil {
-		log.Error("ensureLatestPrice fail", zap.String("od", od.Key()), zap.Error(err))
+		o.Logger().Error("ensureLatestPrice fail", zap.String("od", od.Key()), zap.Error(err))
 		if action == ormo.OdActionEnter || action == ormo.OdActionLimitEnter {
 			if od.GetInfoInt64(odInfoLocalTrigger) > 0 {
-				ormo.AddTriggerOd(o.Account, od)
+				o.addTriggerOd(od)
 			}
 			return
 		}
@@ -1233,71 +1788,207 @@ func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
 	case ormo.OdActionTrailing:
 		o.setTrailingStop(od)
 	default:
-		log.Error("unknown od action", zap.String("action", action), zap.String("key", od.Key()))
+		o.Logger().Error("unknown od action", zap.String("action", action), zap.String("key", od.Key()))
 		return
 	}
 	if err != nil {
-		log.Error("ConsumeOrderQueue error", zap.String("acc", o.Account),
+		o.Logger().Error("ConsumeOrderQueue error", zap.String("acc", o.Account),
 			zap.String("action", action), zap.Error(err))
 	}
 	if od.Enter != nil && od.Enter.OrderID != "" {
 		od.SetInfo(odInfoLocalTrigger, nil)
 	} else if od.Enter != nil && od.Status <= ormo.InOutStatusPartEnter && od.GetInfoInt64(odInfoLocalTrigger) > 0 {
-		ormo.AddTriggerOd(o.Account, od)
+		o.addTriggerOd(od)
 	}
 	if od.IsDirty() {
 		err = od.Save()
 		if err != nil {
-			log.Error("save od for exg status fail", zap.String("acc", o.Account),
+			o.Logger().Error("save od for exg status fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.Error(err))
 		}
 	}
 	logFields := []zap.Field{zap.String("acc", o.Account), zap.String("key", od.Key())}
 	if action == ormo.OdActionEnter {
 		if od.Enter.OrderID != "" && od.Status < ormo.InOutStatusFullExit {
-			log.Info("Enter Order Submitted", logFields...)
+			o.Logger().Info("Enter Order Submitted", logFields...)
 		} else if od.Status >= ormo.InOutStatusFullExit {
 			logFields = append(logFields, zap.String("exitTag", od.ExitTag))
-			log.Info("Enter Order Closed", logFields...)
+			o.Logger().Info("Enter Order Closed", logFields...)
 		}
 	} else if action == ormo.OdActionExit {
 		if od.Exit.OrderID != "" {
 			logFields = append(logFields, zap.Int64("state", od.Status))
-			log.Info("Exit Order Submitted", logFields...)
+			o.Logger().Info("Exit Order Submitted", logFields...)
 		} else if od.Status >= ormo.InOutStatusFullExit {
 			logFields = append(logFields, zap.String("exitTag", od.ExitTag))
-			log.Info("Exit Order Closed", logFields...)
+			o.Logger().Info("Exit Order Closed", logFields...)
 		}
 	}
 }
 
 func (o *LiveOrderMgr) WatchMyTrades() {
-	out, err := exg.Default.WatchMyTrades(map[string]interface{}{
-		banexg.ParamAccount: o.Account,
-	})
-	if err != nil {
-		log.Error("WatchMyTrades fail", zap.String("acc", o.Account), zap.Error(err))
-		return
-	}
 	if !atomic.CompareAndSwapInt32(&o.isWatchMyTrade, 0, 1) {
 		return
 	}
-	go func() {
-		defer func() {
-			atomic.StoreInt32(&o.isWatchMyTrade, 0)
-		}()
-		for trade := range out {
-			orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
-			if trade.State == banexg.OdStatusOpen {
-				continue
-			}
-			o.handleMyTrade(trade)
+	if !o.startWorker(nil, func(ctx context.Context) {
+		defer atomic.StoreInt32(&o.isWatchMyTrade, 0)
+		exchange := o.exchangeClient()
+		if exchange == nil {
+			o.Logger().Error("WatchMyTrades requires an exchange", zap.String("acc", o.Account))
+			return
 		}
-	}()
+		o.watchMyTradesLoopContext(ctx, exchange.WatchMyTrades, defaultMyTradeWatchRetry)
+	}) {
+		atomic.StoreInt32(&o.isWatchMyTrade, 0)
+	}
+}
+
+func (o *LiveOrderMgr) watchMyTradesLoop(
+	watch func(map[string]interface{}) (chan *banexg.MyTrade, *errs.Error), retryDelay time.Duration,
+) {
+	o.watchMyTradesLoopDone(o.done(), watch, retryDelay)
+}
+
+func (o *LiveOrderMgr) watchMyTradesLoopContext(ctx context.Context,
+	watch func(map[string]interface{}) (chan *banexg.MyTrade, *errs.Error), retryDelay time.Duration,
+) {
+	if ctx == nil {
+		o.watchMyTradesLoopDone(nil, watch, retryDelay)
+		return
+	}
+	o.watchMyTradesLoopDone(ctx.Done(), watch, retryDelay)
+}
+
+func (o *LiveOrderMgr) watchMyTradesLoopDone(done <-chan struct{},
+	watch func(map[string]interface{}) (chan *banexg.MyTrade, *errs.Error), retryDelay time.Duration,
+) {
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		out, err := watch(map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			o.Logger().Error("WatchMyTrades fail, retrying", zap.String("acc", o.Account), zap.Error(err))
+		} else if out == nil {
+			o.Logger().Error("WatchMyTrades returned nil stream, retrying", zap.String("acc", o.Account))
+		} else {
+			streamOpen := true
+			for streamOpen {
+				select {
+				case <-done:
+					return
+				case trade, ok := <-out:
+					if !ok {
+						streamOpen = false
+						o.Logger().Warn("WatchMyTrades stream closed, retrying", zap.String("acc", o.Account),
+							zap.Duration("after", retryDelay))
+						continue
+					}
+					if o.runtimeDeps {
+						o.dump.Add(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
+					} else {
+						orm.AddDumpRow(orm.DumpWsMyTrade, trade.Symbol+trade.ID, trade)
+					}
+					if trade.State != banexg.OdStatusOpen {
+						o.handleMyTrade(trade)
+					}
+				}
+			}
+		}
+		if !waitForWorker(done, retryDelay) {
+			return
+		}
+	}
+}
+
+func waitForWorker(done <-chan struct{}, delay time.Duration) bool {
+	if delay <= 0 {
+		select {
+		case <-done:
+			return false
+		default:
+			return true
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-done:
+		return false
+	}
+}
+
+func (o *LiveOrderMgr) reconcilePendingMarketEntries(ods []*ormo.InOutOrder) {
+	cutoff := o.priceNow() - pendingMarketEntryReconcileAfter.Milliseconds()
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return
+	}
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		enter := od.Enter
+		if enter == nil || enter.OrderID == "" || enter.OrderType != banexg.OdTypeMarket ||
+			enter.Status == ormo.OdStatusClosed || enter.Filled > AmtDust || enter.UpdateAt > cutoff {
+			lock.Unlock()
+			continue
+		}
+		orderID, symbol, odKey := enter.OrderID, od.Symbol, od.Key()
+		lock.Unlock()
+
+		res, err := exchange.FetchOrder(symbol, orderID, map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			o.Logger().Warn("reconcile pending market entry fetch fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if res == nil || res.ID != orderID {
+			o.Logger().Warn("reconcile pending market entry invalid response", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID))
+			continue
+		}
+		if res.Filled <= AmtDust {
+			continue
+		}
+
+		lock = od.Lock()
+		enter = od.Enter
+		if enter == nil || enter.OrderID != orderID || enter.OrderType != banexg.OdTypeMarket ||
+			enter.Status == ormo.OdStatusClosed || enter.Filled > AmtDust {
+			lock.Unlock()
+			continue
+		}
+		beforeFilled, beforeStatus := enter.Filled, od.Status
+		err = o.applyAuthoritativeEnterOrder(od, res)
+		changed := enter.Filled > beforeFilled+AmtDust || od.Status != beforeStatus
+		filled, average := enter.Filled, enter.Average
+		lock.Unlock()
+		if err != nil {
+			o.Logger().Error("reconcile pending market entry apply fail", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID), zap.Error(err))
+			continue
+		}
+		if changed {
+			o.Logger().Info("reconciled pending market entry", zap.String("acc", o.Account),
+				zap.String("key", odKey), zap.String("orderId", orderID),
+				zap.Float64("filled", filled), zap.Float64("average", average))
+		}
+	}
 }
 
 func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
-	if _, ok := core.PairsMap[trade.Symbol]; !ok {
+	if !o.pairEnabled(trade.Symbol) {
 		// 忽略不处理的交易对
 		return
 	}
@@ -1313,25 +2004,24 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 	}
 	o.lockExgIdMap.Lock()
 	iod, ok := o.exgIdMap[odKey]
-	// OKX: When a trigger/algo order fires, it creates a new order with different ordId.
-	// The original algo order is stored with key "algo:XXX", try matching by AlgoId.
-	// OKX触发单触发后会生成新的ordId，原始algo订单以"algo:XXX"为key存储，需要用AlgoId匹配
-	if !ok && trade.AlgoId != "" {
-		algoKey := trade.Symbol + "algo:" + trade.AlgoId
-		iod, ok = o.exgIdMap[algoKey]
-		if ok {
-			// Update exgIdMap to use the new ordId for subsequent trades
-			// 更新exgIdMap使用新的ordId，以便后续交易能匹配
-			o.exgIdMap[odKey] = iod
+	// Adapters normalize triggered-order relations to the canonical order key.
+	if !ok {
+		if orderEventID := o.orderEventOrderID(trade); orderEventID != "" {
+			algoKey := trade.Symbol + orderEventID
+			iod, ok = o.exgIdMap[algoKey]
+			if ok {
+				// Update exgIdMap to use the new ordId for subsequent trades.
+				o.exgIdMap[odKey] = iod
+			}
 		}
 	}
 	o.lockExgIdMap.Unlock()
 	if !ok {
 		// Check whether the order is placed by a robot
 		// 检查是否是机器人下单
-		orderId := getClientOrderId(trade.ClientID)
+		orderId := o.getClientOrderID(trade.ClientID)
 		if orderId > 0 {
-			openOds, lock := ormo.GetOpenODs(o.Account)
+			openOds, lock := o.openOrders()
 			lock.Lock()
 			iod, _ = openOds[orderId]
 			lock.Unlock()
@@ -1339,7 +2029,7 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		if iod == nil {
 			if orderId > 0 {
 				// 可能订单已完成，从OpenODs中移除了
-				log.Warn("no order found in OpenODs, skip handleMyTrade", zap.String("acc", o.Account),
+				o.Logger().Warn("no order found in OpenODs, skip handleMyTrade", zap.String("acc", o.Account),
 					zap.String("clientID", trade.ClientID), zap.Int64("inoutId", orderId))
 			} else {
 				// No matching order, recorded in unMatchTrades
@@ -1364,14 +2054,14 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		if iod.Exit != nil {
 			exitID = iod.Exit.OrderID
 		}
-		_, matchedTrigger := matchTriggerExitTrade(iod, trade)
+		_, matchedTrigger := o.matchTriggerExitTrade(iod, trade)
 		if trade.Order == "" || trade.Order != enterID && trade.Order != exitID && !matchedTrigger {
 			return
 		}
 	}
 	err := o.updateByMyTrade(iod, trade)
 	if err != nil {
-		log.Error("updateByMyTrade fail", zap.String("acc", o.Account), zap.String("key", iod.Key()),
+		o.Logger().Error("updateByMyTrade fail", zap.String("acc", o.Account), zap.String("key", iod.Key()),
 			zap.String("trade", trade.ID), zap.Error(err))
 	}
 	subOd := iod.Exit
@@ -1381,11 +2071,11 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 	if subOd != nil {
 		err = o.consumeUnMatches(iod, subOd)
 		if err != nil {
-			log.Error("consumeUnMatches for WatchMyTrades fail", zap.String("acc", o.Account),
+			o.Logger().Error("consumeUnMatches for WatchMyTrades fail", zap.String("acc", o.Account),
 				zap.String("key", iod.Key()), zap.Error(err))
 		}
 	} else {
-		log.Error("handleMyTrade: subOd nil", zap.String("acc", o.Account), zap.String("key", iod.Key()),
+		o.Logger().Error("handleMyTrade: subOd nil", zap.String("acc", o.Account), zap.String("key", iod.Key()),
 			zap.String("trade", trade.ID), zap.String("side", trade.Side),
 			zap.String("clientId", trade.ClientID), zap.String("order", trade.Order))
 	}
@@ -1399,62 +2089,89 @@ func (o *LiveOrderMgr) handleMyTrade(trade *banexg.MyTrade) {
 		}
 		err = iod.Save()
 		if err != nil {
-			log.Error("save od from myTrade fail", zap.String("acc", o.Account),
+			o.Logger().Error("save od from myTrade fail", zap.String("acc", o.Account),
 				zap.String("key", iod.Key()), zap.Error(err))
 		}
 	}
 }
 
-/*
-Parse the order ClientID passed into the exchange
-For Binance: botName_inOutId_randNum (underscore separated)
-For OKX: {nameHash6}{orderId12}{rand4} (fixed-length alphanumeric)
-解析传入交易所的订单ClientID
-*/
-func getClientOrderId(clientId string) int64 {
-	if strings.Contains(clientId, "_") {
-		// Binance format: underscore separated
-		arr := strings.Split(clientId, "_")
-		if len(arr) < 2 || arr[0] != config.Name {
-			return 0
-		}
-		val, err := strconv.ParseInt(arr[1], 10, 64)
-		if err != nil {
-			return 0
-		}
-		return val
+func (o *LiveOrderMgr) getClientOrderID(clientID string) int64 {
+	if o == nil || o.orderEvents == nil || o.orderNamespace == "" {
+		return 0
 	}
-	// OKX format: fixed-length {nameHash6}{orderId12}{rand4}
-	if len(clientId) >= 18 {
-		nameHash := utils.HashToAlphaNum(config.Name, 6)
-		if strings.HasPrefix(clientId, nameHash) {
-			orderIdStr := clientId[6:18]
-			val, err := strconv.ParseInt(orderIdStr, 10, 64)
-			if err != nil {
-				return 0
-			}
-			return val
-		}
+	orderID := o.orderEvents.ParseClientOrderID(o.orderNamespace, clientID)
+	if orderID <= 0 {
+		return 0
 	}
-	return 0
+	return orderID
+}
+
+// buildClientOrderID keeps live order identity on the manager-owned exchange
+// and namespace. The legacy InOutOrder.ClientId method remains available for
+// callers that cannot return an error, but live submissions must fail closed
+// when an installed adapter capability rejects its contract.
+func (o *LiveOrderMgr) buildClientOrderID(od *ormo.InOutOrder, randomize bool) (string, *errs.Error) {
+	if o == nil || od == nil {
+		return "", errs.NewMsg(core.ErrBadConfig, "order and live manager are required")
+	}
+	namespace := o.orderNamespace
+	if namespace == "" && !o.runtimeDeps {
+		namespace = config.Name
+	}
+	if namespace == "" && o.runtimeDeps {
+		return "", errs.NewMsg(core.ErrBadConfig, "runtime order namespace is required")
+	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return "", errs.NewMsg(core.ErrExgNotInit, "exchange is required to build order identity")
+	}
+	return exg.BuildClientOrderIDChecked(exchange, o.exchangeName(), namespace,
+		od.ID, od.GetInfoString(ormo.OdInfoClientID), randomize)
+}
+
+func (o *LiveOrderMgr) orderEventOrderID(trade *banexg.MyTrade) string {
+	if o == nil || o.orderEvents == nil || trade == nil {
+		return ""
+	}
+	return o.orderEvents.GetOrderEventOrderID(trade)
+}
+
+func (o *LiveOrderMgr) normalizeOrderTimestamp(order *banexg.Order, fallback int64) int64 {
+	if o != nil && o.orderEvents != nil {
+		return o.orderEvents.NormalizeOrderTimestamp(order, fallback)
+	}
+	if order == nil || order.Timestamp < fallback {
+		return fallback
+	}
+	return order.Timestamp
+}
+
+func (o *LiveOrderMgr) pairEnabled(symbol string) bool {
+	if o != nil && o.runtimeDeps {
+		return o.coreState != nil && o.coreState.PairEnabled(symbol)
+	}
+	if o != nil && o.coreState != nil {
+		return o.coreState.PairEnabled(symbol)
+	}
+	return core.LegacyPairEnabled(symbol)
 }
 
 func (o *LiveOrderMgr) TrialUnMatchesForever() {
-	if !core.EnvReal {
+	if !o.isEnvReal() {
 		return
 	}
 	if !atomic.CompareAndSwapInt32(&o.isTrialUnMatches, 0, 1) {
 		return
 	}
-	go func() {
+	if !o.startWorker(nil, func(ctx context.Context) {
 		defer func() {
 			atomic.StoreInt32(&o.isTrialUnMatches, 0)
 		}()
 		for {
-			if !core.Sleep(time.Second * 3) {
+			if !waitForWorker(ctx.Done(), time.Second*3) {
 				return
 			}
-			curMS := btime.UTCStamp()
+			curMS := o.priceNow()
 			// 清理doneTrades中过期1分钟以上的
 			o.lockDoneTrades.Lock()
 			for td, stamp := range o.doneTrades {
@@ -1505,12 +2222,12 @@ func (o *LiveOrderMgr) TrialUnMatchesForever() {
 					err := o.updateByMyTrade(iod, trade)
 					lock.Unlock()
 					if err != nil {
-						log.Error("updateByMyTrade fail", zap.String("acc", o.Account), zap.String("key", iod.Key()),
+						o.Logger().Error("updateByMyTrade fail", zap.String("acc", o.Account), zap.String("key", iod.Key()),
 							zap.String("trade", trade.ID), zap.Error(err))
 					}
 					continue
 				}
-				if getClientOrderId(trade.ClientID) == 0 {
+				if o.getClientOrderID(trade.ClientID) == 0 {
 					// Record non-robot orders to check if a third party closes or places an order
 					// 记录非机器人订单，检查是否第三方平仓或下单
 					odTrades, _ := pairTrades[odKey]
@@ -1518,13 +2235,13 @@ func (o *LiveOrderMgr) TrialUnMatchesForever() {
 				}
 			}
 			unHandleNum := 0
-			allowTakeOver := config.TakeOverStrat != ""
+			allowTakeOver := o.takeOverStrategy() != ""
 			// Traverse third-party orders to check whether they are closed or tracked
 			// 遍历第三方订单，检查是否平仓或跟踪
 			for _, trades := range pairTrades {
 				exOd, err := banexg.MergeMyTrades(trades)
 				if err != nil {
-					log.Error("MergeMyTrades fail", zap.String("acc", o.Account), zap.Int("num", len(trades)), zap.Error(err))
+					o.Logger().Error("MergeMyTrades fail", zap.String("acc", o.Account), zap.Int("num", len(trades)), zap.Error(err))
 					continue
 				}
 				if o.exitByMyOrder(exOd) {
@@ -1535,23 +2252,25 @@ func (o *LiveOrderMgr) TrialUnMatchesForever() {
 				unHandleNum += 1
 			}
 			if unHandleNum > 0 {
-				log.Warn(fmt.Sprintf("expired unmatch orders %s: %v", o.Account, unHandleNum))
+				o.Logger().Warn(fmt.Sprintf("expired unmatch orders %s: %v", o.Account, unHandleNum))
 			}
-			err := ormo.SaveDirtyODs(orm.DbTrades, o.Account)
+			err := o.saveDirtyODs()
 			if err != nil {
-				log.Error("SaveDirtyODs fail", zap.String("acc", o.Account), zap.Error(err))
+				o.Logger().Error("SaveDirtyODs fail", zap.String("acc", o.Account), zap.Error(err))
 			}
 		}
-	}()
+	}) {
+		atomic.StoreInt32(&o.isTrialUnMatches, 0)
+	}
 }
 
 func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrade) *errs.Error {
 	if trade.State == banexg.OdStatusOpen {
 		return nil
 	}
-	odId := getClientOrderId(trade.ClientID)
+	odId := o.getClientOrderID(trade.ClientID)
 	if odId > 0 && odId != od.ID {
-		log.Error("update order with wrong", zap.String("acc", o.Account), zap.String("trade", trade.ID),
+		o.Logger().Error("update order with wrong", zap.String("acc", o.Account), zap.String("trade", trade.ID),
 			zap.String("order", trade.Order), zap.String("client", trade.ClientID),
 			zap.String("for", od.Key()), zap.String("side", trade.Side))
 		return nil
@@ -1563,7 +2282,7 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 	isEnter := od.Short == isSell
 	subOd := od.Exit
 	dirtTag := "enter"
-	triggerTag, matchedTrigger := matchTriggerExitTrade(od, trade)
+	triggerTag, matchedTrigger := o.matchTriggerExitTrade(od, trade)
 	isStopLoss := matchedTrigger && triggerTag == core.ExitTagStopLoss
 	isTakeProfit := matchedTrigger && triggerTag == core.ExitTagTakeProfit
 	if isEnter {
@@ -1573,13 +2292,13 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		// Exit order. This is mostly caused by stop loss or take profit. No exit sub-order has been created yet.
 		// 退出订单，这里多半是止损止盈导致的退出，尚未创建退出子订单
 		if isStopLoss {
-			od.SetExit(0, core.ExitTagStopLoss, banexg.OdTypeMarket, 0)
+			o.setExit(od, 0, core.ExitTagStopLoss, banexg.OdTypeMarket, 0)
 		} else if isTakeProfit {
-			od.SetExit(0, core.ExitTagTakeProfit, banexg.OdTypeTakeProfit, 0)
+			o.setExit(od, 0, core.ExitTagTakeProfit, banexg.OdTypeTakeProfit, 0)
 		} else if matchedTrigger && triggerTag == core.ExitTagTrailingStop {
-			od.SetExit(0, core.ExitTagTrailingStop, banexg.OdTypeMarket, 0)
+			o.setExit(od, 0, core.ExitTagTrailingStop, banexg.OdTypeMarket, 0)
 		} else {
-			log.Error(fmt.Sprintf("%s %s subOd %s nil, trade state: %s", o.Account, od.Key(), dirtTag, trade.State))
+			o.Logger().Error(fmt.Sprintf("%s %s subOd %s nil, trade state: %s", o.Account, od.Key(), dirtTag, trade.State))
 			return nil
 		}
 		subOd = od.Exit
@@ -1597,7 +2316,7 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		return nil
 	}
 	if subOd.Status == ormo.OdStatusClosed {
-		log.Debug(fmt.Sprintf("%s %s %s complete, skip trade: %v", o.Account, od.Key(), dirtTag, trade.ID))
+		o.Logger().Debug(fmt.Sprintf("%s %s %s complete, skip trade: %v", o.Account, od.Key(), dirtTag, trade.ID))
 		return nil
 	}
 	if subOd.Enter {
@@ -1649,7 +2368,7 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 			od.DirtyMain = true
 		}
 	} else {
-		log.Error(fmt.Sprintf("unknown bnb order status %s: %s", o.Account, state))
+		o.Logger().Error(fmt.Sprintf("unknown bnb order status %s: %s", o.Account, state))
 	}
 	if od.Status == ormo.InOutStatusFullExit {
 		// May be triggered by stop loss or take profit, delete and set to completed
@@ -1669,12 +2388,12 @@ func (o *LiveOrderMgr) updateByMyTrade(od *ormo.InOutOrder, trade *banexg.MyTrad
 		if err != nil {
 			return err
 		}
-		cancelTriggerOds(od, o.Account)
+		o.cancelTriggerOds(od)
 		o.callBack(od, subOd.Enter)
-		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+		o.fireOdChange(od, strat.OdChgExitFill)
 	} else {
 		o.callBack(od, subOd.Enter)
-		strat.FireOdChange(o.Account, od, strat.OdChgEnterFill)
+		o.fireOdChange(od, strat.OdChgEnterFill)
 	}
 	return nil
 }
@@ -1684,7 +2403,18 @@ func isTriggerTrade(trade *banexg.MyTrade) bool {
 		strings.Contains(trade.Type, banexg.OdTypeTakeProfit))
 }
 
+func (o *LiveOrderMgr) matchTriggerExitTrade(od *ormo.InOutOrder, trade *banexg.MyTrade) (string, bool) {
+	return matchTriggerExitTradeWithID(od, trade, o.getClientOrderID(trade.ClientID))
+}
+
+// matchTriggerExitTrade is retained for pure callers that already have an
+// exact trigger order/client ID. Runtime-bound callers use the method above so
+// adapter-owned client-ID parsing remains outside biz.
 func matchTriggerExitTrade(od *ormo.InOutOrder, trade *banexg.MyTrade) (string, bool) {
+	return matchTriggerExitTradeWithID(od, trade, 0)
+}
+
+func matchTriggerExitTradeWithID(od *ormo.InOutOrder, trade *banexg.MyTrade, clientOrderID int64) (string, bool) {
 	if od == nil || trade == nil || od.Short == (trade.Side == banexg.OdSideSell) {
 		return "", false
 	}
@@ -1706,7 +2436,7 @@ func matchTriggerExitTrade(od *ormo.InOutOrder, trade *banexg.MyTrade) (string, 
 	if tp != nil && tp.ClientId != "" && tp.ClientId == trade.ClientID {
 		return core.ExitTagTakeProfit, true
 	}
-	if getClientOrderId(trade.ClientID) != od.ID {
+	if clientOrderID == 0 || clientOrderID != od.ID {
 		return "", false
 	}
 	if trade.Type == banexg.OdTypeTrailingStopMarket && trailingID != "" {
@@ -1731,7 +2461,11 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 	var err *errs.Error
 	if od.Enter.Amount == 0 {
 		if od.QuoteCost == 0 {
-			wallets := GetWallets(o.Account)
+			wallets := o.walletsForOrder()
+			// 余额长时间未主动拉取时，下单前先同步最新余额
+			if err = wallets.RefreshIfStale(WalletStaleMS); err != nil {
+				o.Logger().Warn("refresh stale wallet fail", zap.String("acc", o.Account), zap.Error(err))
+			}
 			_, err = wallets.EnterOd(od)
 			if err != nil {
 				if err.Code == core.ErrLowFunds || err.Code == core.ErrInvalidCost {
@@ -1739,29 +2473,33 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 					return nil
 				} else {
 					msg := err.Short()
-					err = od.LocalExit(0, core.ExitTagFatalErr, od.InitPrice, msg, "")
-					strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+					err = o.localExit(od, 0, core.ExitTagFatalErr, od.InitPrice, msg, "")
+					o.fireOdChange(od, strat.OdChgExitFill)
 					if err != nil {
-						log.Error("local exit order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+						o.Logger().Error("local exit order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 					}
 					return errs.NewMsg(core.ErrRunTime, "%s, %s", msg, odKey)
 				}
 			}
 		}
-		err = com.EnsureLatestPrice(od.Symbol)
+		err = o.ensureLatestPrice(od.Symbol)
 		if err != nil {
 			return err
 		}
-		realPrice := com.GetPriceSafe(od.Symbol, od.Enter.Side)
+		realPrice := o.priceSafeExp(od.Symbol, od.Enter.Side, com.PriceExpireMS)
 		if realPrice < 0 {
 			msg := "no valid price"
-			err = od.LocalExit(0, core.ExitTagFatalErr, od.InitPrice, msg, "")
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			err = o.localExit(od, 0, core.ExitTagFatalErr, od.InitPrice, msg, "")
+			o.fireOdChange(od, strat.OdChgExitFill)
 			return errs.NewMsg(errs.CodeParamInvalid, "no valid price")
 		}
 		// The market price should be used to calculate the quantity here, because the input price may be very different from the market price
 		// 这里应使用市价计算数量，因传入价格可能和市价相差很大
-		od.Enter.Amount, err = exg.PrecAmount(exg.Default, od.Symbol, od.QuoteCost/realPrice)
+		exchange := o.exchangeClient()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "exchange is required to size %s", od.Symbol)
+		}
+		od.Enter.Amount, err = exg.PrecAmount(exchange, od.Symbol, od.QuoteCost/realPrice)
 		if err != nil {
 			o.forceDelOd(od, err)
 			return nil
@@ -1773,11 +2511,11 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 	err = o.submitExgOrder(od, true)
 	if err != nil {
 		msg := "submit order fail, local exit"
-		log.Error(msg, zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
-		err = od.LocalExit(0, core.ExitTagFatalErr, od.InitPrice, err.Short(), "")
-		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+		o.Logger().Error(msg, zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+		err = o.localExit(od, 0, core.ExitTagFatalErr, od.InitPrice, err.Short(), "")
+		o.fireOdChange(od, strat.OdChgExitFill)
 		if err != nil {
-			log.Error("local exit order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+			o.Logger().Error("local exit order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 		}
 	}
 	return nil
@@ -1786,17 +2524,17 @@ func (o *LiveOrderMgr) execOrderEnter(od *ormo.InOutOrder) *errs.Error {
 func (o *LiveOrderMgr) forceDelOd(od *ormo.InOutOrder, err *errs.Error) {
 	odKey := od.Key()
 	if err != nil {
-		log.Error("del order", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+		o.Logger().Error("del order", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 	}
-	sess, conn, err := ormo.Conn(orm.DbTrades, true)
+	sess, conn, err := o.orderState().Conn(true)
 	if err != nil {
-		log.Error("get db sess fail", zap.String("acc", o.Account), zap.Error(err))
+		o.Logger().Error("get db sess fail", zap.String("acc", o.Account), zap.Error(err))
 		return
 	}
 	defer conn.Close()
 	err = sess.DelOrder(od)
 	if err != nil {
-		log.Error("del order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
+		o.Logger().Error("del order fail", zap.String("acc", o.Account), zap.String("key", odKey), zap.Error(err))
 	}
 }
 
@@ -1807,16 +2545,20 @@ func (o *LiveOrderMgr) tryExitPendingEnter(od *ormo.InOutOrder) *errs.Error {
 	// May not have entered yet, or may not have fully entered
 	// 可能尚未入场，或未完全入场
 	if od.Enter.OrderID != "" {
-		order, err := exg.Default.CancelOrder(od.Enter.OrderID, od.Symbol, map[string]interface{}{
+		exchange := o.exchangeClient()
+		if exchange == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "exchange is required to cancel %s", od.Key())
+		}
+		order, err := exchange.CancelOrder(od.Enter.OrderID, od.Symbol, map[string]interface{}{
 			banexg.ParamAccount: o.Account,
 		})
 		if err != nil {
-			log.Error("cancel order fail", zap.String("acc", o.Account),
+			o.Logger().Error("cancel order fail", zap.String("acc", o.Account),
 				zap.String("key", od.Key()), zap.String("err", err.Short()))
 		} else {
 			err = o.updateOdByExgRes(od, true, order)
 			if err != nil {
-				log.Error("apply cancel res fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
+				o.Logger().Error("apply cancel res fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
 			}
 		}
 	}
@@ -1826,7 +2568,7 @@ func (o *LiveOrderMgr) tryExitPendingEnter(od *ormo.InOutOrder) *errs.Error {
 			od.Enter.Status = ormo.OdStatusClosed
 			od.DirtyEnter = true
 		}
-		od.SetExit(0, core.ExitTagForceExit, "", od.Enter.Price)
+		o.setExit(od, 0, core.ExitTagForceExit, "", od.Enter.Price)
 		od.Exit.Status = ormo.OdStatusClosed
 		od.DirtyMain = true
 		od.DirtyExit = true
@@ -1834,8 +2576,8 @@ func (o *LiveOrderMgr) tryExitPendingEnter(od *ormo.InOutOrder) *errs.Error {
 		if err != nil {
 			return err
 		}
-		cancelTriggerOds(od, o.Account)
-		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+		o.cancelTriggerOds(od)
+		o.fireOdChange(od, strat.OdChgExitFill)
 		o.forceDelOd(od, nil)
 		return nil
 	} else if od.Enter.Status < ormo.OdStatusClosed {
@@ -1872,14 +2614,17 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		}
 	}
 	var err *errs.Error
-	exchange := exg.Default
-	leverage, maxLeverage := exg.GetLeverage(od.Symbol, od.QuoteCost, o.Account)
-	if isEnter && od.Leverage > 0 && od.Leverage != leverage && banexg.IsContract(core.Market) {
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to submit %s", od.Key())
+	}
+	leverage, maxLeverage := exchange.GetLeverage(od.Symbol, od.QuoteCost, o.Account)
+	if isEnter && od.Leverage > 0 && od.Leverage != leverage && o.isContract() {
 		newLeverage := od.Leverage
 		if maxLeverage >= 1 {
 			newLeverage = min(maxLeverage, od.Leverage)
 		} else {
-			log.Warn("get symbol leverage fail", zap.String("pair", od.Symbol),
+			o.Logger().Warn("get symbol leverage fail", zap.String("pair", od.Symbol),
 				zap.Float64("cur", leverage), zap.Float64("max", maxLeverage))
 		}
 		if newLeverage != leverage {
@@ -1900,13 +2645,13 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 		}
 	}
 	if subOd.OrderType == "" {
-		subOd.OrderType = config.OrderType
+		subOd.OrderType = o.orderType()
 		setDirty()
 	}
 	if subOd.Price == 0 && subOd.OrderType != banexg.OdTypeMarket {
 		// calculate the price when it is not a market order
 		// 非市价单时，计算价格
-		buyPrice, sellPrice := o.getLimitPrice(od.Symbol, config.LimitVolSecs)
+		buyPrice, sellPrice := o.getLimitPrice(od.Symbol, o.limitVolSecs())
 		price := sellPrice
 		if subOd.Side == banexg.OdSideBuy {
 			price = buyPrice
@@ -1933,17 +2678,21 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			if err != nil {
 				return err
 			}
-			cancelTriggerOds(od, o.Account)
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			o.cancelTriggerOds(od)
+			o.fireOdChange(od, strat.OdChgExitFill)
 			return nil
 		}
 	}
 	side, amount, price := subOd.Side, subOd.Amount, subOd.Price
+	clientID, clientErr := o.buildClientOrderID(od, true)
+	if clientErr != nil {
+		return clientErr
+	}
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
-		banexg.ParamClientOrderId: od.ClientId(true),
+		banexg.ParamClientOrderId: clientID,
 	}
-	if core.IsContract {
+	if o.isContract() {
 		params[banexg.ParamPositionSide] = "LONG"
 		if od.Short {
 			params[banexg.ParamPositionSide] = "SHORT"
@@ -1951,10 +2700,10 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	}
 	if isEnter && od.Stop > 0 {
 		// 设置触发价入场价格
-		curPrice := com.GetPriceSafe(od.Symbol, side)
+		curPrice := o.priceSafeExp(od.Symbol, side, com.PriceExpireMS)
 		if curPrice <= 0 {
 			// 价格缓存过期，从订单簿获取
-			book, err := exg.GetOdBook(od.Symbol)
+			book, err := o.getOrderBook(od.Symbol)
 			if err == nil && book != nil {
 				if side == banexg.OdSideBuy && len(book.Asks.Price) > 0 {
 					curPrice = book.Asks.Price[0]
@@ -1986,12 +2735,12 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	if err != nil {
 		if !isEnter && err.Code == errs.CodeReduceOnlyRejected {
 			msg := "ReduceOnly Order is rejected."
-			log.Error("close exg pos fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
-			err = od.LocalExit(btime.UTCStamp(), core.ExitTagNoMatch, price, msg, banexg.OdTypeMarket)
+			o.Logger().Error("close exg pos fail", zap.String("acc", o.Account), zap.String("key", od.Key()), zap.Error(err))
+			err = o.localExit(od, o.priceNow(), core.ExitTagNoMatch, price, msg, banexg.OdTypeMarket)
 			if err != nil {
 				return err
 			}
-			cancelTriggerOds(od, o.Account)
+			o.cancelTriggerOds(od)
 			o.callBack(od, isEnter)
 			return nil
 		} else {
@@ -2013,7 +2762,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	} else {
 		// Close a position and cancel associated orders
 		// 平仓，取消关联订单
-		cancelTriggerOds(od, o.Account)
+		o.cancelTriggerOds(od)
 	}
 	return nil
 }
@@ -2128,13 +2877,13 @@ func (o *LiveOrderMgr) updateOdByExgRes(od *ormo.InOutOrder, isEnter bool, res *
 		if od.Status == ormo.InOutStatusFullExit {
 			err := o.finishOrder(od)
 			o.callBack(od, false)
-			strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+			o.fireOdChange(od, strat.OdChgExitFill)
 			if err != nil {
 				return err
 			}
 		} else {
 			o.callBack(od, true)
-			strat.FireOdChange(o.Account, od, strat.OdChgEnterFill)
+			o.fireOdChange(od, strat.OdChgEnterFill)
 		}
 	}
 	return o.consumeUnMatches(od, subOd)
@@ -2191,6 +2940,34 @@ func (o *LiveOrderMgr) consumeUnMatches(od *ormo.InOutOrder, subOd *ormo.ExOrder
 	return nil
 }
 
+func (o *LiveOrderMgr) getOrderBook(pair string) (*banexg.OrderBook, *errs.Error) {
+	if o == nil || !o.runtimeDeps {
+		return exg.GetOdBook(pair)
+	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "exchange is required to load order book for %s", pair)
+	}
+	nowMS := o.priceNow()
+	if o.coreState != nil {
+		if book, ok := o.coreState.GetOdBook(pair); ok && book != nil &&
+			(o.orderBookTTL() <= 0 || book.TimeStamp+o.orderBookTTL() >= nowMS) {
+			return book, nil
+		}
+	}
+	book, err := exchange.FetchOrderBook(pair, 1000, nil)
+	if err != nil {
+		return nil, err
+	}
+	if book == nil {
+		return nil, errs.NewMsg(errs.CodeRunTime, "exchange returned nil order book for %s", pair)
+	}
+	if o.coreState != nil {
+		o.coreState.SetOdBook(pair, book)
+	}
+	return book, nil
+}
+
 type VolPrice struct {
 	BuyPrice  float64
 	SellPrice float64
@@ -2203,6 +2980,9 @@ Get the approximate limit order price for a specified number of seconds
 获取等待指定秒数的大概限价单价格
 */
 func (o *LiveOrderMgr) getLimitPrice(pair string, waitSecs int) (float64, float64) {
+	if o.runtimeDeps {
+		return o.getRuntimeLimitPrice(pair, waitSecs)
+	}
 	key := fmt.Sprintf("%s_%s", pair, strconv.Itoa(waitSecs))
 	lockVolPrices.Lock()
 	cache, ok := volPrices[key]
@@ -2214,7 +2994,7 @@ func (o *LiveOrderMgr) getLimitPrice(pair string, waitSecs int) (float64, float6
 	// 无效或过期，需要重新计算
 	avgVol, lastVol, err := getPairMinsVol(pair, 5)
 	if err != nil {
-		log.Error("getPairMinsVol fail for getLimitPrice", zap.String("acc", o.Account), zap.String("pair", pair), zap.Error(err))
+		o.Logger().Error("getPairMinsVol fail for getLimitPrice", zap.String("acc", o.Account), zap.String("pair", pair), zap.Error(err))
 	}
 	secsFlt := float64(waitSecs)
 	// 5-minute trading volume per second * waiting seconds * 2: The final multiplication by 2 here is to prevent the trading volume from being too low
@@ -2224,7 +3004,7 @@ func (o *LiveOrderMgr) getLimitPrice(pair string, waitSecs int) (float64, float6
 	var buyPrice, sellPrice float64
 	if err != nil {
 		buyPrice, sellPrice = 0, 0
-		log.Error("get odBook fail", zap.String("acc", o.Account), zap.String("pair", pair), zap.Error(err))
+		o.Logger().Error("get odBook fail", zap.String("acc", o.Account), zap.String("pair", pair), zap.Error(err))
 	} else {
 		buyPrice, _, _ = book.AvgPrice(banexg.OdSideBuy, depth)
 		sellPrice, _, _ = book.AvgPrice(banexg.OdSideSell, depth)
@@ -2239,6 +3019,44 @@ func (o *LiveOrderMgr) getLimitPrice(pair string, waitSecs int) (float64, float6
 		ExpireMS:  btime.TimeMS() + expMS,
 	}
 	lockVolPrices.Unlock()
+	return buyPrice, sellPrice
+}
+
+func (o *LiveOrderMgr) getRuntimeLimitPrice(pair string, waitSecs int) (float64, float64) {
+	key := fmt.Sprintf("%s_%s", pair, strconv.Itoa(waitSecs))
+	nowMS := o.priceNow()
+	if o.volPrices != nil {
+		o.lockVolPrices.Lock()
+		cache, ok := o.volPrices[key]
+		o.lockVolPrices.Unlock()
+		if ok && cache.ExpireMS > nowMS {
+			return cache.BuyPrice, cache.SellPrice
+		}
+	}
+	avgVol, lastVol, err := o.getPairMinsVol(pair, 5)
+	if err != nil {
+		o.Logger().Error("getPairMinsVol fail for getLimitPrice", zap.String("acc", o.Account),
+			zap.String("pair", pair), zap.Error(err))
+	}
+	secsFlt := float64(waitSecs)
+	depth := min(avgVol/30*secsFlt, lastVol/60*secsFlt)
+	book, err := o.getOrderBook(pair)
+	if err != nil {
+		o.Logger().Error("get odBook fail", zap.String("acc", o.Account), zap.String("pair", pair), zap.Error(err))
+		return 0, 0
+	}
+	buyPrice, _, _ := book.AvgPrice(banexg.OdSideBuy, depth)
+	sellPrice, _, _ := book.AvgPrice(banexg.OdSideSell, depth)
+	if o.volPrices != nil {
+		expMS := min(3000, int64(waitSecs)*100)
+		o.lockVolPrices.Lock()
+		o.volPrices[key] = &VolPrice{
+			BuyPrice:  buyPrice,
+			SellPrice: sellPrice,
+			ExpireMS:  o.priceNow() + expMS,
+		}
+		o.lockVolPrices.Unlock()
+	}
 	return buyPrice, sellPrice
 }
 
@@ -2284,6 +3102,83 @@ func getPairMinsVol(pair string, num int) (float64, float64, *errs.Error) {
 	return avg, last, err
 }
 
+func (o *LiveOrderMgr) getPairMinsVol(pair string, num int) (float64, float64, *errs.Error) {
+	if o == nil || !o.runtimeDeps {
+		return getPairMinsVol(pair, num)
+	}
+	cacheKey := fmt.Sprintf("%s_%v", pair, num)
+	curMs := o.priceNow()
+	if o.pairVolMap != nil {
+		o.lockPairVolMap.Lock()
+		cache, ok := o.pairVolMap[cacheKey]
+		o.lockPairVolMap.Unlock()
+		if ok && cache.ExpireMS > curMs {
+			return cache.AvgVol, cache.LastVol, nil
+		}
+	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return 0, 0, errs.NewMsg(core.ErrExgNotInit, "exchange is required to load volume for %s", pair)
+	}
+	exs, err := o.exSymbolCur(pair)
+	if err != nil {
+		return 0, 0, err
+	}
+	storage := o.walletDeps.Storage
+	if storage == nil && o.symbols != nil {
+		storage = o.symbols.Storage()
+	}
+	if storage == nil {
+		return 0, 0, errs.NewMsg(core.ErrDbConnFail, "runtime storage is required to load volume for %s", pair)
+	}
+	ctx := context.Background()
+	if o.runtimeCore != nil && o.runtimeCore.Context() != nil {
+		ctx = o.runtimeCore.Context()
+	}
+	sess, conn, connErr := storage.Conn(ctx)
+	if connErr != nil {
+		return 0, 0, connErr
+	}
+	defer conn.Release()
+	var cfg *config.Config
+	if o.walletDeps.Config != nil {
+		cfg = o.walletDeps.Config.View()
+	}
+	options := orm.NewKlineRuntimeOptions(o.runtimeCore, cfg, curMs, storage)
+	_, rows, err := sess.AutoFetchSeriesWithOptions(exchange, exs, "1m", 0, 0, num, false, nil, options)
+	if err != nil {
+		if o.pairVolMap != nil {
+			expireMS := utils2.AlignTfMSecs(curMs+60000, 60000)
+			o.lockPairVolMap.Lock()
+			o.pairVolMap[cacheKey] = &PairValItem{ExpireMS: expireMS}
+			o.lockPairVolMap.Unlock()
+		}
+		return 0, 0, err
+	}
+	if len(rows) == 0 {
+		if o.pairVolMap != nil {
+			expireMS := utils2.AlignTfMSecs(curMs+60000, 60000)
+			o.lockPairVolMap.Lock()
+			o.pairVolMap[cacheKey] = &PairValItem{ExpireMS: expireMS}
+			o.lockPairVolMap.Unlock()
+		}
+		return 0, 0, nil
+	}
+	var sumVol float64
+	for _, row := range rows {
+		vol, _ := row.VolumeValue()
+		sumVol += vol
+	}
+	lastVol, _ := rows[len(rows)-1].VolumeValue()
+	if o.pairVolMap != nil {
+		expireMS := utils2.AlignTfMSecs(curMs+60000, 60000)
+		o.lockPairVolMap.Lock()
+		o.pairVolMap[cacheKey] = &PairValItem{AvgVol: sumVol / float64(len(rows)), LastVol: lastVol, ExpireMS: expireMS}
+		o.lockPairVolMap.Unlock()
+	}
+	return sumVol / float64(len(rows)), lastVol, nil
+}
+
 func getEnterTriggerTarget(od *ormo.InOutOrder) (string, float64, bool) {
 	if od == nil || od.Enter == nil {
 		return "", 0, false
@@ -2321,6 +3216,24 @@ func isFarEnter(od *ormo.InOutOrder) bool {
 	return isFarLimitTrigger(od.Symbol, side, price)
 }
 
+func (o *LiveOrderMgr) isFarEnter(od *ormo.InOutOrder) bool {
+	if o == nil || !o.runtimeDeps {
+		return isFarEnter(od)
+	}
+	if od == nil || od.Enter == nil || od.Enter.OrderID != "" || od.Status > ormo.InOutStatusPartEnter {
+		return false
+	}
+	side, price, ok := getEnterTriggerTarget(od)
+	if !ok {
+		return false
+	}
+	stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
+	if stopAfter == 0 || stopAfter <= o.priceNow() {
+		return false
+	}
+	return o.isFarLimitTrigger(od.Symbol, side, price)
+}
+
 /*
 Determine whether an order is a limit order that is difficult to execute for a long time
 判断一个订单是否是长时间难以成交的限价单
@@ -2336,6 +3249,19 @@ func isFarLimitTrigger(pair, side string, price float64) bool {
 		return false
 	}
 	return true
+}
+
+func (o *LiveOrderMgr) isFarLimitTrigger(pair, side string, price float64) bool {
+	if o == nil || !o.runtimeDeps {
+		return isFarLimitTrigger(pair, side, price)
+	}
+	secs, rate, err := o.getSecsByLimit(pair, side, price)
+	if err != nil {
+		o.Logger().Error("getSecsByLimit for isFarLimitTrigger fail", zap.String("pair", pair),
+			zap.String("side", side), zap.Float64("price", price), zap.Error(err))
+		return false
+	}
+	return secs >= o.putLimitSecs() || rate < 0.8
 }
 
 var verifyTriggersLock deadlock.Mutex
@@ -2361,15 +3287,16 @@ func VerifyTriggerOds() {
 }
 
 func getSubmittedEnterOdsByPair(account string) map[string][]*ormo.InOutOrder {
-	openOds, lock := ormo.GetOpenODs(account)
-	lock.Lock()
-	list := make([]*ormo.InOutOrder, 0, len(openOds))
-	for _, od := range openOds {
-		list = append(list, od)
-	}
-	lock.Unlock()
+	return submittedEnterOrdersByPair(getOpenOdsSnapshot(account))
+}
+
+func (o *LiveOrderMgr) submittedEnterOrdersByPair() map[string][]*ormo.InOutOrder {
+	return submittedEnterOrdersByPair(o.openOrdersSnapshot())
+}
+
+func submittedEnterOrdersByPair(orders []*ormo.InOutOrder) map[string][]*ormo.InOutOrder {
 	submitOds := make(map[string][]*ormo.InOutOrder)
-	for _, od := range list {
+	for _, od := range orders {
 		if od == nil || od.Exit != nil {
 			continue
 		}
@@ -2393,20 +3320,316 @@ func getSubmittedEnterOdsByPair(account string) map[string][]*ormo.InOutOrder {
 	return submitOds
 }
 
+func (o *LiveOrderMgr) openOrdersSnapshot() []*ormo.InOutOrder {
+	openOds, lock := o.openOrders()
+	lock.Lock()
+	list := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		list = append(list, od)
+	}
+	lock.Unlock()
+	return list
+}
+
+func (o *LiveOrderMgr) triggerOrders() (map[string]map[int64]*ormo.InOutOrder, *deadlock.Mutex) {
+	if o != nil && o.runtimeDeps {
+		if state := o.orderState(); state != nil {
+			return state.GetTriggerODs(o.Account)
+		}
+		return make(map[string]map[int64]*ormo.InOutOrder), &deadlock.Mutex{}
+	}
+	return ormo.GetTriggerODs(o.Account)
+}
+
+func getOpenOdsSnapshot(account string) []*ormo.InOutOrder {
+	openOds, lock := ormo.GetOpenODs(account)
+	lock.Lock()
+	list := make([]*ormo.InOutOrder, 0, len(openOds))
+	for _, od := range openOds {
+		list = append(list, od)
+	}
+	lock.Unlock()
+	return list
+}
+
+func isMissingFullEnterTrigger(od *ormo.InOutOrder, key string) bool {
+	if od == nil || od.Status != ormo.InOutStatusFullEnter || od.Exit != nil || od.HoldAmount() <= AmtDust {
+		return false
+	}
+	tg := od.GetExitTrigger(key)
+	return tg != nil && tg.ExitTrigger != nil && tg.Price > 0 && tg.OrderId == "" &&
+		!(key == ormo.OdInfoStopLoss && tg.Tag == core.ExitTagTrailingStop)
+}
+
+func exchangeTriggerTypeKey(od *banexg.Order) string {
+	if od == nil {
+		return ""
+	}
+	hasTakeProfit := od.TakeProfitPrice > 0
+	hasStopLoss := od.StopLossPrice > 0
+	if hasTakeProfit && hasStopLoss {
+		return "?"
+	}
+	if hasTakeProfit {
+		return ormo.OdInfoTakeProfit
+	}
+	if hasStopLoss {
+		return ormo.OdInfoStopLoss
+	}
+	odType := strings.ToLower(od.Type)
+	if strings.Contains(odType, "trailing") {
+		return ""
+	}
+	if strings.Contains(odType, "take_profit") {
+		return ormo.OdInfoTakeProfit
+	}
+	if strings.Contains(odType, "stop_loss") {
+		return ormo.OdInfoStopLoss
+	}
+	return "?"
+}
+
+func triggerValueMatches(want, got float64) bool {
+	scale := max(math.Abs(want), math.Abs(got))
+	return math.Abs(want-got) <= max(AmtDust, scale*1e-8)
+}
+
+func exchangeTriggerPrice(od *banexg.Order, key string) (float64, bool) {
+	if key == ormo.OdInfoStopLoss {
+		if od.TakeProfitPrice > 0 {
+			return 0, false
+		}
+		if od.StopLossPrice > 0 {
+			return od.StopLossPrice, true
+		}
+	} else {
+		if od.StopLossPrice > 0 {
+			return 0, false
+		}
+		if od.TakeProfitPrice > 0 {
+			return od.TakeProfitPrice, true
+		}
+	}
+	price := od.TriggerPrice
+	if price <= 0 {
+		price = od.StopPrice
+	}
+	return price, price > 0
+}
+
+func legacyExchangeTriggerMatches(od *ormo.InOutOrder, key string, exOd *banexg.Order) bool {
+	tg := od.GetExitTrigger(key)
+	if tg == nil || tg.ExitTrigger == nil || tg.Price <= 0 {
+		return false
+	}
+	typeKey := exchangeTriggerTypeKey(exOd)
+	if typeKey == "" || typeKey != "?" && typeKey != key {
+		return false
+	}
+	price, ok := exchangeTriggerPrice(exOd, key)
+	if !ok || !triggerValueMatches(tg.Price, price) {
+		return false
+	}
+	if tg.Limit > 0 {
+		if exOd.Price <= 0 || !triggerValueMatches(tg.Limit, exOd.Price) {
+			return false
+		}
+	} else if exOd.Price > AmtDust {
+		return false
+	}
+	wantAmount := od.HoldAmount()
+	if tg.Rate > 0 && tg.Rate < 1 {
+		wantAmount *= tg.Rate
+	}
+	return exOd.Amount > AmtDust && triggerValueMatches(wantAmount, exOd.Amount)
+}
+
+func (o *LiveOrderMgr) isExchangeTriggerFor(od *ormo.InOutOrder, exOd *banexg.Order) bool {
+	if od == nil || exOd == nil || exOd.ID == "" || exOd.ClientOrderID == "" || exOd.Symbol != od.Symbol ||
+		o.getClientOrderID(exOd.ClientOrderID) != od.ID || banexg.IsOrderDone(exOd.Status) {
+		return false
+	}
+	if od.Enter != nil && exOd.ID == od.Enter.OrderID || od.Exit != nil && exOd.ID == od.Exit.OrderID ||
+		exOd.ID == od.GetInfoString(ormo.OdInfoTrailingID) {
+		return false
+	}
+	wantSide := banexg.OdSideSell
+	wantPos := banexg.PosSideLong
+	if od.Short {
+		wantSide = banexg.OdSideBuy
+		wantPos = banexg.PosSideShort
+	}
+	return (exOd.Side == "" || exOd.Side == wantSide) &&
+		(exOd.PositionSide == "" || exOd.PositionSide == wantPos)
+}
+
+func (o *LiveOrderMgr) restoreExchangeTriggersLocked(od *ormo.InOutOrder, exOds []*banexg.Order) map[string]bool {
+	type candidate struct {
+		order *banexg.Order
+		key   string
+	}
+	candidates := make([]candidate, 0)
+	blocked := map[string]bool{}
+	for _, exOd := range exOds {
+		if !o.isExchangeTriggerFor(od, exOd) {
+			continue
+		}
+		key := exchangeTriggerTypeKey(exOd)
+		if key == "" {
+			continue
+		}
+		if key == "?" {
+			matchesStop := legacyExchangeTriggerMatches(od, ormo.OdInfoStopLoss, exOd)
+			matchesTake := legacyExchangeTriggerMatches(od, ormo.OdInfoTakeProfit, exOd)
+			if matchesStop != matchesTake {
+				if matchesStop {
+					key = ormo.OdInfoStopLoss
+				} else {
+					key = ormo.OdInfoTakeProfit
+				}
+			}
+		} else if !legacyExchangeTriggerMatches(od, key, exOd) {
+			key = "?"
+		}
+		candidates = append(candidates, candidate{order: exOd, key: key})
+	}
+	used := make(map[*banexg.Order]bool)
+	for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
+		tg := od.GetExitTrigger(key)
+		if tg == nil || tg.OrderId != "" || tg.ClientId == "" {
+			continue
+		}
+		var exact []*banexg.Order
+		for _, item := range candidates {
+			if item.order.ClientOrderID == tg.ClientId {
+				exact = append(exact, item.order)
+			}
+		}
+		if len(exact) != 1 {
+			if len(exact) > 1 {
+				blocked[key] = true
+			}
+			continue
+		}
+		exOd := exact[0]
+		tg.OrderId = exOd.ID
+		tg.ClientId = exOd.ClientOrderID
+		tg.SaveOld()
+		od.DirtyInfo = true
+		used[exOd] = true
+	}
+	for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
+		tg := od.GetExitTrigger(key)
+		if tg == nil || tg.OrderId != "" || blocked[key] {
+			continue
+		}
+		var matches []*banexg.Order
+		hasUnknown := false
+		for _, item := range candidates {
+			if used[item.order] {
+				continue
+			}
+			if item.key == "?" {
+				hasUnknown = true
+			} else if item.key == key {
+				matches = append(matches, item.order)
+			}
+		}
+		if tg.ClientId != "" {
+			if !hasUnknown && len(matches) == 0 {
+				continue
+			}
+			blocked[key] = true
+			o.Logger().Warn("exchange trigger client ID mismatch", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("trigger", key), zap.Int("num", len(matches)))
+			continue
+		}
+		if hasUnknown || len(matches) > 1 {
+			blocked[key] = true
+			o.Logger().Warn("ambiguous exchange triggers match local order", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.String("trigger", key), zap.Int("num", len(matches)))
+			continue
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		exOd := matches[0]
+		tg.OrderId = exOd.ID
+		tg.ClientId = exOd.ClientOrderID
+		tg.SaveOld()
+		od.DirtyInfo = true
+		used[exOd] = true
+	}
+	return blocked
+}
+
+func (o *LiveOrderMgr) restoreExchangeTriggers(ods []*ormo.InOutOrder, exOds []*banexg.Order) {
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		o.restoreExchangeTriggersLocked(od, exOds)
+		lock.Unlock()
+	}
+}
+
+func (o *LiveOrderMgr) healMissingFullEnterTriggers(ods []*ormo.InOutOrder, exOds []*banexg.Order) {
+	for _, od := range ods {
+		if od == nil {
+			continue
+		}
+		lock := od.Lock()
+		blocked := o.restoreExchangeTriggersLocked(od, exOds)
+		for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
+			if blocked[key] || !isMissingFullEnterTrigger(od, key) {
+				continue
+			}
+			o.editTriggerOd(od, key)
+		}
+		if od.IsDirty() {
+			if err := od.Save(); err != nil {
+				o.Logger().Error("save healed trigger fail", zap.String("acc", o.Account),
+					zap.String("key", od.Key()), zap.Error(err))
+			}
+		}
+		lock.Unlock()
+	}
+}
+
 func verifyAccountTriggerOds(account string) {
-	triggerOds, lock := ormo.GetTriggerODs(account)
+	odMgr := GetLiveOdMgr(account)
+	if odMgr != nil {
+		odMgr.verifyAccountTriggerOds()
+	}
+}
+
+func (odMgr *LiveOrderMgr) verifyAccountTriggerOds() {
+	if odMgr == nil {
+		return
+	}
+	account := odMgr.Account
+	triggerOds, lock := odMgr.triggerOrders()
 	var resOds []*ormo.InOutOrder
 	var copyTriggers = make(map[string]map[int64]*ormo.InOutOrder)
 	lock.Lock()
 	for key, val := range triggerOds {
-		copyTriggers[key] = val
+		copyTriggers[key] = make(map[int64]*ormo.InOutOrder, len(val))
+		for orderID, order := range val {
+			copyTriggers[key][orderID] = order
+		}
 	}
 	lock.Unlock()
 	var zeros []string
 	var fails []string
-	odMgr := GetLiveOdMgr(account)
+	exOds, err := odMgr.fetchAccountOpenOrders(account, 0)
+	if err != nil {
+		odMgr.Logger().Error("fetch open orders for trigger verification fail", zap.String("acc", account), zap.Error(err))
+	} else {
+		odMgr.healMissingFullEnterTriggers(odMgr.openOrdersSnapshot(), exOds)
+	}
 	var saves []*ormo.InOutOrder
-	submitOds := getSubmittedEnterOdsByPair(account)
+	submitOds := odMgr.submittedEnterOrdersByPair()
 	pairs := make(map[string]struct{})
 	for pair := range copyTriggers {
 		pairs[pair] = struct{}{}
@@ -2420,18 +3643,18 @@ func verifyAccountTriggerOds(account string) {
 		var book *banexg.OrderBook
 		// Calculate the past 50 minutes, average volume, and last minute volume
 		// 计算过去50分钟，平均成交量，以及最后一分钟成交量
-		avgVol, lastVol, err := getPairMinsVol(pair, 50)
+		avgVol, lastVol, err := odMgr.getPairMinsVol(pair, 50)
 		if err == nil {
 			secsVol = max(avgVol, lastVol) / 60
 			if secsVol > 0 {
-				book, err = exg.GetOdBook(pair)
+				book, err = odMgr.getOrderBook(pair)
 			} else {
 				zeros = append(zeros, pair)
 			}
 		}
 		if err != nil {
 			fails = append(fails, pair)
-			log.Error("VerifyTriggerOds fail", zap.String("pair", pair), zap.Error(err))
+			odMgr.Logger().Error("VerifyTriggerOds fail", zap.String("pair", pair), zap.Error(err))
 		}
 		calcWait := func(side string, price float64) (int, float64) {
 			waitVol, rate := book.SumVolTo(side, price)
@@ -2451,7 +3674,7 @@ func verifyAccountTriggerOds(account string) {
 				for _, od := range ods {
 					odKey := od.Key()
 					if _, ok := viewKeys[odKey]; ok {
-						log.Error("duplicate order in triggers", zap.String("acc", account), zap.String("key", odKey))
+						odMgr.Logger().Error("duplicate order in triggers", zap.String("acc", account), zap.String("key", odKey))
 						continue
 					}
 					viewKeys[odKey] = true
@@ -2465,11 +3688,11 @@ func verifyAccountTriggerOds(account string) {
 					// Calculate the amount to be purchased and the price ratio to reach the specified price
 					// 计算到指定价格，需要吃进的量，以及价格比例
 					waitSecs, rate := calcWait(subOd.Side, subOd.Price)
-					if waitSecs < config.PutLimitSecs && rate >= 0.8 {
+					if waitSecs < odMgr.putLimitSecs() && rate >= 0.8 {
 						resOds = append(resOds, od)
 					} else {
 						stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
-						if stopAfter > 0 && stopAfter <= btime.TimeMS() {
+						if stopAfter > 0 && stopAfter <= odMgr.priceNow() {
 							cancelTimeoutEnter(odMgr, od)
 							saves = append(saves, od)
 						} else {
@@ -2490,7 +3713,7 @@ func verifyAccountTriggerOds(account string) {
 		}
 		for _, od := range subList {
 			stopAfter := od.GetInfoInt64(ormo.OdInfoStopAfter)
-			if stopAfter > 0 && stopAfter <= btime.TimeMS() {
+			if stopAfter > 0 && stopAfter <= odMgr.priceNow() {
 				cancelTimeoutEnter(odMgr, od)
 				saves = append(saves, od)
 				continue
@@ -2500,12 +3723,12 @@ func verifyAccountTriggerOds(account string) {
 				continue
 			}
 			waitSecs, _ := calcWait(side, price)
-			if waitSecs > config.PutLimitSecs*5 {
+			if waitSecs > odMgr.putLimitSecs()*5 {
 				// Far from execution, rollback to local trigger to avoid fund occupation
 				// 距离成交过远，撤回到本地触发，避免资金占用
 				changed, cancelErr := cancelEnterToLocalTrigger(odMgr, od, waitSecs)
 				if cancelErr != nil {
-					log.Error("rollback exchange enter to local trigger fail", zap.String("acc", account),
+					odMgr.Logger().Error("rollback exchange enter to local trigger fail", zap.String("acc", account),
 						zap.String("key", od.Key()), zap.Error(cancelErr))
 				}
 				if changed {
@@ -2515,10 +3738,10 @@ func verifyAccountTriggerOds(account string) {
 		}
 	}
 	if len(zeros)+len(fails) > 0 {
-		log.Warn("calc vols for triggers fail", zap.Strings("zeros", zeros), zap.Strings("fail", fails))
+		odMgr.Logger().Warn("calc vols for triggers fail", zap.Strings("zeros", zeros), zap.Strings("fail", fails))
 	}
 	if len(resOds) > 0 {
-		log.Info("put trigger to exchange", zap.Int("num", len(resOds)))
+		odMgr.Logger().Info("put trigger to exchange", zap.Int("num", len(resOds)))
 	}
 	for _, od := range resOds {
 		if od.Status >= ormo.InOutStatusFullExit {
@@ -2528,9 +3751,9 @@ func verifyAccountTriggerOds(account string) {
 		// again until the local-trigger ownership is durable.
 		if od.IsDirty() {
 			if err := od.Save(); err != nil {
-				log.Error("persist trigger before exchange submit fail", zap.String("acc", account),
+				odMgr.Logger().Error("persist trigger before exchange submit fail", zap.String("acc", account),
 					zap.String("key", od.Key()), zap.Error(err))
-				ormo.AddTriggerOd(account, od)
+				odMgr.addTriggerOd(od)
 				continue
 			}
 		}
@@ -2570,6 +3793,26 @@ func getSecsByLimit(pair, side string, price float64) (int, float64, *errs.Error
 	return int(math.Round(waitVol / secsVol)), rate, nil
 }
 
+func (o *LiveOrderMgr) getSecsByLimit(pair, side string, price float64) (int, float64, *errs.Error) {
+	if o == nil || !o.runtimeDeps {
+		return getSecsByLimit(pair, side, price)
+	}
+	avgVol, lastVol, err := o.getPairMinsVol(pair, 50)
+	if err != nil {
+		return 0, 1, err
+	}
+	secsVol := max(avgVol, lastVol) / 60
+	if secsVol == 0 {
+		return 0, 1, nil
+	}
+	book, err := o.getOrderBook(pair)
+	if err != nil {
+		return 0, 1, err
+	}
+	waitVol, rate := book.SumVolTo(side, price)
+	return int(math.Round(waitVol / secsVol)), rate, nil
+}
+
 func saveIOrders(saveOds []*ormo.InOutOrder) {
 	// There are orders that need to be saved
 	// 有需要保存的订单
@@ -2597,10 +3840,8 @@ func (o *LiveOrderMgr) applyAuthoritativeEnterOrder(od *ormo.InOutOrder, res *ba
 	}
 	wasFullEnter := od.Status == ormo.InOutStatusFullEnter && od.Enter.Status == ormo.OdStatusClosed
 
-	// Binance futures uses the order creation time as Timestamp. Use the latest
-	// known timestamp so an authoritative fetch is not rejected as older state.
 	normalized := *res
-	normalized.Timestamp = max(res.Timestamp, res.LastTradeTimestamp, res.LastUpdateTimestamp, od.Enter.UpdateAt)
+	normalized.Timestamp = o.normalizeOrderTimestamp(res, od.Enter.UpdateAt)
 	err := o.updateOdByExgRes(od, true, &normalized)
 	if err != nil || !od.IsDirty() {
 		return err
@@ -2614,7 +3855,11 @@ func (o *LiveOrderMgr) applyAuthoritativeEnterOrder(od *ormo.InOutOrder, res *ba
 }
 
 func (o *LiveOrderMgr) reconcileEnterAfterCancelRejected(od *ormo.InOutOrder, orderID string) *errs.Error {
-	res, err := exg.Default.FetchOrder(od.Symbol, orderID, map[string]interface{}{
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to reconcile %s", od.Key())
+	}
+	res, err := exchange.FetchOrder(od.Symbol, orderID, map[string]interface{}{
 		banexg.ParamAccount: o.Account,
 	})
 	if err != nil {
@@ -2636,7 +3881,7 @@ func (o *LiveOrderMgr) rollbackCanceledEnterToLocalTrigger(od *ormo.InOutOrder, 
 	o.lockExgIdMap.Unlock()
 	od.Enter.OrderID = ""
 	od.Enter.Status = ormo.OdStatusInit
-	od.Enter.UpdateAt = btime.UTCStamp()
+	od.Enter.UpdateAt = o.priceNow()
 	od.DirtyEnter = true
 	if od.Status != ormo.InOutStatusInit && od.Enter.Filled == 0 {
 		od.Status = ormo.InOutStatusInit
@@ -2646,11 +3891,11 @@ func (o *LiveOrderMgr) rollbackCanceledEnterToLocalTrigger(od *ormo.InOutOrder, 
 	if err := od.Save(); err != nil {
 		// Keep runtime ownership after an already-confirmed external cancel. The
 		// trigger verifier will retry persistence before any resubmission.
-		ormo.AddTriggerOd(o.Account, od)
+		o.addTriggerOd(od)
 		return err
 	}
-	ormo.AddTriggerOd(o.Account, od)
-	log.Info("rollback enter to local trigger", zap.String("acc", o.Account),
+	o.addTriggerOd(od)
+	o.Logger().Info("rollback enter to local trigger", zap.String("acc", o.Account),
 		zap.String("key", od.Key()), zap.String("orderId", orderID), zap.Int("waitSecs", waitSecs))
 	return nil
 }
@@ -2671,7 +3916,11 @@ func cancelEnterToLocalTrigger(odMgr *LiveOrderMgr, od *ormo.InOutOrder, waitSec
 	if err := od.Save(); err != nil {
 		return false, err
 	}
-	res, err := exg.Default.CancelOrder(orderId, od.Symbol, map[string]interface{}{
+	exchange := odMgr.exchangeClient()
+	if exchange == nil {
+		return false, errs.NewMsg(core.ErrExgNotInit, "exchange is required to cancel %s", od.Key())
+	}
+	res, err := exchange.CancelOrder(orderId, od.Symbol, map[string]interface{}{
 		banexg.ParamAccount: odMgr.Account,
 	})
 	if err != nil {
@@ -2709,7 +3958,11 @@ func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {
 	}
 	if od.Enter.OrderID != "" {
 		orderID := od.Enter.OrderID
-		res, err := exg.Default.CancelOrder(orderID, od.Symbol, map[string]interface{}{
+		exchange := odMgr.exchangeClient()
+		if exchange == nil {
+			return
+		}
+		res, err := exchange.CancelOrder(orderID, od.Symbol, map[string]interface{}{
 			banexg.ParamAccount: odMgr.Account,
 		})
 		if err != nil {
@@ -2738,8 +3991,8 @@ func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {
 		// Not yet filled, exit directly
 		// 尚未入场，直接退出
 		od.SetInfo(odInfoLocalTrigger, nil)
-		err := od.LocalExit(0, core.ExitTagForceExit, od.InitPrice, "reach StopEnterBars", "")
-		strat.FireOdChange(odMgr.Account, od, strat.OdChgExitFill)
+		err := odMgr.localExit(od, 0, core.ExitTagForceExit, od.InitPrice, "reach StopEnterBars", "")
+		odMgr.fireOdChange(od, strat.OdChgExitFill)
 		if err != nil {
 			log.Error("local exit for StopEnterBars fail", zap.String("key", od.Key()), zap.Error(err))
 		}
@@ -2751,7 +4004,7 @@ func cancelTimeoutEnter(odMgr *LiveOrderMgr, od *ormo.InOutOrder) {
 		od.DirtyMain = true
 		od.DirtyEnter = true
 		odMgr.callBack(od, true)
-		strat.FireOdChange(odMgr.Account, od, strat.OdChgEnterFill)
+		odMgr.fireOdChange(od, strat.OdChgEnterFill)
 	}
 }
 
@@ -2760,11 +4013,14 @@ func (o *LiveOrderMgr) editLimitOd(od *ormo.InOutOrder, action string) *errs.Err
 	if action == ormo.OdActionLimitExit {
 		subOd = od.Exit
 	}
-	exchange := exg.Default
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return errs.NewMsg(core.ErrExgNotInit, "exchange is required to edit %s", od.Key())
+	}
 	args := map[string]interface{}{
 		banexg.ParamAccount: o.Account,
 	}
-	if core.Market != banexg.MarketLinear && core.Market != banexg.MarketInverse {
+	if o.marketType() != banexg.MarketLinear && o.marketType() != banexg.MarketInverse {
 		// Spot, Margin, Options. Cancel the old order first, then create a new order
 		// 现货，保证金，期权。先取消旧订单，再创建新订单
 		_, err := exchange.CancelOrder(subOd.OrderID, od.Symbol, args)
@@ -2795,11 +4051,15 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 		// 取消跟踪止损
 		oldID := od.GetInfoString(ormo.OdInfoTrailingID)
 		if oldID != "" {
-			_, err := exg.Default.CancelOrder(oldID, od.Symbol, map[string]interface{}{
+			exchange := o.exchangeClient()
+			if exchange == nil {
+				return
+			}
+			_, err := exchange.CancelOrder(oldID, od.Symbol, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
 			})
 			if err != nil {
-				log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
+				o.Logger().Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 			od.SetInfo(ormo.OdInfoCallbackPct, 0.0)
 			od.SetInfo(ormo.OdInfoActivePrice, nil)
@@ -2808,11 +4068,20 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 		}
 		return
 	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return
+	}
+	clientID, clientErr := o.buildClientOrderID(od, true)
+	if clientErr != nil {
+		o.Logger().Error("build trailing client order id fail", zap.String("key", od.Key()), zap.Error(clientErr))
+		return
+	}
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
-		banexg.ParamClientOrderId: od.ClientId(true),
+		banexg.ParamClientOrderId: clientID,
 	}
-	if core.IsContract {
+	if o.isContract() {
 		params[banexg.ParamPositionSide] = "LONG"
 		if od.Short {
 			params[banexg.ParamPositionSide] = "SHORT"
@@ -2835,30 +4104,30 @@ func (o *LiveOrderMgr) setTrailingStop(od *ormo.InOutOrder) {
 	}
 	amt := od.HoldAmount()
 	if amt <= AmtDust {
-		log.Warn("skip trailing trigger without position", zap.String("acc", o.Account), zap.String("key", od.Key()))
+		o.Logger().Warn("skip trailing trigger without position", zap.String("acc", o.Account), zap.String("key", od.Key()))
 		return
 	}
-	log.Debug("set trailing trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
+	o.Logger().Debug("set trailing trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
 		zap.Float64("callbackRate", callRate), zap.Float64("qty", amt),
 		zap.Float64("activePrice", activePrice))
-	res, err := exg.Default.CreateOrder(od.Symbol, odType, side, amt, 0, params)
+	res, err := exchange.CreateOrder(od.Symbol, odType, side, amt, 0, params)
 	if err != nil {
-		log.Error("put trigger fail", zap.String("key", od.Key()), zap.Error(err))
+		o.Logger().Error("put trigger fail", zap.String("key", od.Key()), zap.Error(err))
 	} else {
 		oldID := od.GetInfoString(ormo.OdInfoTrailingID)
 		if oldID != "" {
-			_, err = exg.Default.CancelOrder(oldID, od.Symbol, map[string]interface{}{
+			_, err = exchange.CancelOrder(oldID, od.Symbol, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
 			})
 			if err != nil {
-				log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
+				o.Logger().Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 		}
 		od.SetInfo(ormo.OdInfoTrailingID, res.ID)
 	}
 	err = od.Save()
 	if err != nil {
-		log.Error("save order fail", zap.String("key", od.Key()), zap.Error(err))
+		o.Logger().Error("save order fail", zap.String("key", od.Key()), zap.Error(err))
 	}
 }
 
@@ -2867,7 +4136,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		return
 	}
 	tg := od.GetExitTrigger(prefix)
-	if tg == nil || tg.Old != nil && tg.Old.Equal(tg.ExitTrigger) {
+	if tg == nil || tg.OrderId != "" && tg.Old != nil && tg.Old.Equal(tg.ExitTrigger) {
 		return
 	}
 	tg.SaveOld()
@@ -2876,11 +4145,15 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		// Stop loss/take profit is not set, or needs to be cancelled
 		// 未设置止损/止盈，或需要撤销
 		if tg.OrderId != "" {
-			_, err := exg.Default.CancelOrder(tg.OrderId, od.Symbol, map[string]interface{}{
+			exchange := o.exchangeClient()
+			if exchange == nil {
+				return
+			}
+			_, err := exchange.CancelOrder(tg.OrderId, od.Symbol, map[string]interface{}{
 				banexg.ParamAccount: o.Account,
 			})
 			if err != nil {
-				log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
+				o.Logger().Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 			tg.OrderId = ""
 			tg.ClientId = ""
@@ -2888,23 +4161,37 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		}
 		return
 	}
-	clientID := od.ClientId(true)
+	clientID := tg.ClientId
+	if clientID == "" || tg.OrderId != "" {
+		var clientErr *errs.Error
+		clientID, clientErr = o.buildClientOrderID(od, true)
+		if clientErr != nil {
+			o.Logger().Error("build trigger client order id fail", zap.String("key", od.Key()),
+				zap.String("prefix", prefix), zap.Error(clientErr))
+			return
+		}
+		tg.ClientId = clientID
+		od.DirtyInfo = true
+		if tg.OrderId == "" && o.isLive() {
+			if err := od.Save(); err != nil {
+				o.Logger().Error("save trigger client id before create fail", zap.String("acc", o.Account),
+					zap.String("key", od.Key()), zap.String("prefix", prefix), zap.Error(err))
+				return
+			}
+		}
+	}
 	params := map[string]interface{}{
 		banexg.ParamAccount:       o.Account,
 		banexg.ParamClientOrderId: clientID,
 	}
-	if core.IsContract {
+	if o.isContract() {
 		params[banexg.ParamPositionSide] = "LONG"
 		if od.Short {
 			params[banexg.ParamPositionSide] = "SHORT"
 		}
 	}
-	var odType = banexg.OdTypeMarket
-	var price = tg.Price
-	if tg.Limit > 0 {
-		odType = banexg.OdTypeLimit
-		price = tg.Limit
-	}
+	var odType string
+	var price float64
 	// 这里不应设置ClosePosition仓位止盈止损，否则多策略或多个订单止盈止损会互相覆盖
 	// 双向持仓无需设置ReduceOnly
 	if prefix == ormo.OdActionStopLoss {
@@ -2912,10 +4199,20 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 			return
 		}
 		params[banexg.ParamStopLossPrice] = tg.Price
+		odType = banexg.OdTypeStopLoss
+		if tg.Limit > 0 {
+			odType = banexg.OdTypeStopLossLimit
+			price = tg.Limit
+		}
 	} else if prefix == ormo.OdActionTakeProfit {
 		params[banexg.ParamTakeProfitPrice] = tg.Price
+		odType = banexg.OdTypeTakeProfitMarket
+		if tg.Limit > 0 {
+			odType = banexg.OdTypeTakeProfitLimit
+			price = tg.Limit
+		}
 	} else {
-		log.Error("invalid trigger ", zap.String("prefix", prefix))
+		o.Logger().Error("invalid trigger ", zap.String("prefix", prefix))
 		return
 	}
 	side := banexg.OdSideSell
@@ -2927,7 +4224,7 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		amt *= tg.Rate
 	}
 	if amt <= AmtDust {
-		log.Warn("skip trigger without position", zap.String("acc", o.Account), zap.String("key", od.Key()),
+		o.Logger().Warn("skip trigger without position", zap.String("acc", o.Account), zap.String("key", od.Key()),
 			zap.String("prefix", prefix))
 		return
 	}
@@ -2935,32 +4232,45 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 	if retryNum > 0 {
 		params[banexg.ParamRetry] = int(retryNum)
 	}
-	log.Debug("set trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
+	o.Logger().Debug("set trigger", zap.String("acc", o.Account), zap.String("key", od.Key()),
 		zap.Float64("amt", od.HoldAmount()), zap.Float64("qmt", amt),
 		zap.Float64("price", od.Enter.Average))
-	res, err := exg.Default.CreateOrder(od.Symbol, odType, side, amt, price, params)
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return
+	}
+	res, err := exchange.CreateOrder(od.Symbol, odType, side, amt, price, params)
+	if err != nil {
+		if err.Code == errs.CodeDuplicateRequest {
+			res, err = o.fetchTriggerByClientID(od.Symbol, clientID)
+			if err == nil && (res == nil || res.ID == "" || banexg.IsOrderDone(res.Status) ||
+				res.ClientOrderID != "" && res.ClientOrderID != clientID || res.Symbol != "" && res.Symbol != od.Symbol) {
+				err = errs.NewMsg(errs.CodeDataNotFound, "duplicate trigger lookup returned no open order")
+			}
+		}
+	}
 	if err != nil {
 		if err.Code == errs.CodeOrderWouldTrigger {
 			// Stop loss and stop profit are executed immediately, and the position is closed at the market price
 			// 止损止盈立刻成交，则市价平仓
-			log.Warn("Order would immediately trigger, exit", zap.String("key", od.Key()))
+			o.Logger().Warn("Order would immediately trigger, exit", zap.String("key", od.Key()))
 			exitTag := prefix
 			if tg.Tag != "" {
 				exitTag = tg.Tag
 			}
-			od.SetExit(0, exitTag, banexg.OdTypeMarket, 0)
+			o.setExit(od, 0, exitTag, banexg.OdTypeMarket, 0)
 			err = o.execOrderExit(od)
 			if err != nil {
-				log.Error("exit order by trigger fail", zap.String("key", od.Key()), zap.Error(err))
+				o.Logger().Error("exit order by trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 			err = od.Save()
 			if err != nil {
-				log.Error("save order by trigger fail", zap.String("key", od.Key()), zap.Error(err))
+				o.Logger().Error("save order by trigger fail", zap.String("key", od.Key()), zap.Error(err))
 			}
 		} else {
 			// When the update of stop loss and stop profit fails, the old stop profit and stop loss will not be cancelled
 			// 更新止损止盈失败时，不取消旧的止盈止损
-			log.Error("put trigger order fail", zap.String("key", od.Key()), zap.Error(err))
+			o.Logger().Error("put trigger order fail", zap.String("key", od.Key()), zap.Error(err))
 		}
 		return
 	}
@@ -2974,17 +4284,30 @@ func (o *LiveOrderMgr) editTriggerOd(od *ormo.InOutOrder, prefix string) {
 		od.DirtyInfo = true
 	}
 	if orderId != "" && (res == nil || res.Status == "open") {
-		res, err = exg.Default.CancelOrder(orderId, od.Symbol, map[string]interface{}{
+		res, err = exchange.CancelOrder(orderId, od.Symbol, map[string]interface{}{
 			banexg.ParamAccount: o.Account,
 		})
 		if err != nil {
-			log.Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
+			o.Logger().Error("cancel old trigger fail", zap.String("key", od.Key()), zap.Error(err))
 		} else if res != nil {
 			o.lockDoneKeys.Lock()
 			o.doneKeys[od.Symbol+orderId] = res.Timestamp
 			o.lockDoneKeys.Unlock()
 		}
 	}
+}
+
+func (o *LiveOrderMgr) fetchTriggerByClientID(symbol, clientID string) (*banexg.Order, *errs.Error) {
+	params := map[string]interface{}{
+		banexg.ParamAccount:       o.Account,
+		banexg.ParamClientOrderId: clientID,
+		banexg.ParamAlgoOrder:     true,
+	}
+	exchange := o.exchangeClient()
+	if exchange == nil {
+		return nil, errs.NewMsg(core.ErrExgNotInit, "exchange is required to fetch trigger %s", symbol)
+	}
+	return exchange.FetchOrder(symbol, "", params)
 }
 
 func (o *LiveOrderMgr) checkTradeDone(k string) bool {
@@ -3007,6 +4330,14 @@ Cancel the associated order of the order. When the order is closed, the associat
 取消订单的关联订单。订单在平仓时，关联的止损单止盈单不会自动退出，需要调用此方法退出
 */
 func cancelTriggerOds(od *ormo.InOutOrder, account string) {
+	cancelTriggerOdsWithExchange(exg.Default, od, account)
+}
+
+func (o *LiveOrderMgr) cancelTriggerOds(od *ormo.InOutOrder) {
+	cancelTriggerOdsWithExchange(o.exchangeClient(), od, o.Account)
+}
+
+func cancelTriggerOdsWithExchange(exchange banexg.BanExchange, od *ormo.InOutOrder, account string) {
 	sl := od.GetStopLoss()
 	tp := od.GetTakeProfit()
 	if sl == nil && tp == nil {
@@ -3020,12 +4351,16 @@ func cancelTriggerOds(od *ormo.InOutOrder, account string) {
 			return
 		}
 	}
+	if exchange == nil {
+		log.Error("cancel trigger order fail, exchange is nil", zap.String("key", odKey))
+		return
+	}
 	args := map[string]interface{}{
 		banexg.ParamAccount: account,
 	}
 	var logFields []zap.Field
 	if sl != nil && sl.OrderId != "" {
-		_, err := exg.Default.CancelOrder(sl.OrderId, od.Symbol, args)
+		_, err := exchange.CancelOrder(sl.OrderId, od.Symbol, args)
 		if err != nil {
 			log.Warn("cancel stopLoss fail", zap.String("key", odKey), zap.String("err", err.Short()))
 		} else {
@@ -3036,7 +4371,7 @@ func cancelTriggerOds(od *ormo.InOutOrder, account string) {
 		od.DirtyInfo = true
 	}
 	if tp != nil && tp.OrderId != "" {
-		_, err := exg.Default.CancelOrder(tp.OrderId, od.Symbol, args)
+		_, err := exchange.CancelOrder(tp.OrderId, od.Symbol, args)
 		if err != nil {
 			log.Warn("cancel takeProfit fail", zap.String("key", odKey), zap.String("err", err.Short()))
 		} else {
@@ -3059,7 +4394,7 @@ When the transaction is in progress, it will be saved to the database internally
 实盘时，内部会保存到数据库
 */
 func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
-	curMS := btime.UTCStamp()
+	curMS := o.priceNow()
 	if od.Enter != nil && od.Enter.OrderID != "" {
 		o.lockDoneKeys.Lock()
 		o.doneKeys[od.Symbol+od.Enter.OrderID] = curMS
@@ -3070,37 +4405,55 @@ func (o *LiveOrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 		o.doneKeys[od.Symbol+od.Exit.OrderID] = curMS
 		o.lockDoneKeys.Unlock()
 	}
-	log.Info("Finish Order", zap.String("acc", o.Account), zap.String("key", od.Key()),
+	o.Logger().Info("Finish Order", zap.String("acc", o.Account), zap.String("key", od.Key()),
 		zap.String("tag", od.ExitTag))
 	return o.OrderMgr.finishOrder(od)
 }
 
 func (o *LiveOrderMgr) WatchLeverages() {
-	if !core.IsContract {
+	if !o.isContract() {
 		return
 	}
-	if !exg.Default.HasApi(banexg.ApiWatchAccountConfig, core.Market) {
+	exchange := o.exchangeClient()
+	if exchange == nil || !exchange.HasApi(banexg.ApiWatchAccountConfig, o.marketType()) {
 		return
 	}
 	if !atomic.CompareAndSwapInt32(&o.isWatchAccConfig, 0, 1) {
 		return
 	}
-	out, err := exg.Default.WatchAccountConfig(map[string]interface{}{
-		banexg.ParamAccount: o.Account,
-	})
-	if err != nil {
-		atomic.StoreInt32(&o.isWatchAccConfig, 0)
-		log.Error("WatchLeverages error", zap.Error(err))
-		return
-	}
-	go func() {
+	if !o.startWorker(nil, func(ctx context.Context) {
 		defer func() {
 			atomic.StoreInt32(&o.isWatchAccConfig, 0)
 		}()
-		for range out {
-			continue
+		out, err := exchange.WatchAccountConfig(map[string]interface{}{
+			banexg.ParamAccount: o.Account,
+		})
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			o.Logger().Error("WatchLeverages error", zap.Error(err))
+			return
 		}
-	}()
+		if out == nil {
+			o.Logger().Warn("WatchLeverages returned nil stream", zap.String("acc", o.Account))
+			return
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-out:
+				if !ok {
+					return
+				}
+			}
+		}
+	}) {
+		atomic.StoreInt32(&o.isWatchAccConfig, 0)
+	}
 }
 
 /*
@@ -3120,7 +4473,7 @@ func MakeCheckFatalStop(maxIntv int) func() {
 }
 
 func checkAccFatalStop(account string, maxIntv int) {
-	stopUntil, _ := core.NoEnterUntil[account]
+	stopUntil, _ := core.LegacyNoEnterUntilFor(account)
 	if stopUntil >= btime.TimeMS() {
 		return
 	}
@@ -3146,7 +4499,7 @@ func checkAccFatalStop(account string, maxIntv int) {
 		lossRate := calcFatalLoss(wallets, orders, backMins)
 		if lossRate >= rate {
 			lossPct := int(lossRate * 100)
-			core.NoEnterUntil[account] = btime.TimeMS() + int64(config.FatalStopHours)*3600*1000
+			core.SetLegacyNoEnterUntil(account, btime.TimeMS()+int64(config.FatalStopHours)*3600*1000)
 			log.Error(fmt.Sprintf("%v: Loss of %v%% in %v minutes, prohibition of placing orders for %v hours!", account,
 				lossPct, backMins, config.FatalStopHours))
 			break
@@ -3200,6 +4553,8 @@ func (o *LiveOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq
 }
 
 func (o *LiveOrderMgr) CleanUp() *errs.Error {
+	o.Stop()
+	o.Join()
 	return nil
 }
 
@@ -3207,11 +4562,57 @@ func StartLiveOdMgr() {
 	if !core.EnvReal {
 		panic("StartLiveOdMgr for FakeEnv is forbidden:" + core.RunEnv)
 	}
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
+	startLiveOdMgr(nil, nil)
+}
+
+// StartLiveOdMgrWithContext starts all live order workers under one explicit
+// runtime context. The caller owns the environment check for isolated runtimes.
+func StartLiveOdMgrWithContext(ctx context.Context) {
+	startLiveOdMgr(ctx, nil)
+}
+
+// StartLiveOdMgrWithRuntimeDeps starts only the live managers owned by the
+// supplied runtime. It never scans the legacy account or manager registries.
+func StartLiveOdMgrWithRuntimeDeps(deps RuntimeDeps, ctx context.Context) {
+	requireRuntimeDeps(deps)
+	startLiveOdMgr(ctx, &deps)
+}
+
+func startLiveOdMgr(ctx context.Context, deps *RuntimeDeps) {
+	if deps != nil {
+		if deps.Trading == nil {
+			return
+		}
+		managers := deps.Trading.LiveManagersSnapshot()
+		for account, cfg := range deps.AccountConfigs() {
+			if cfg == nil || cfg.NoTrade {
+				continue
+			}
+			odMgr := managers[account]
+			if odMgr == nil || !odMgr.setWorkerContext(ctx) {
+				continue
+			}
+			// Monitor account order flow 监听账户订单流
+			odMgr.WatchMyTrades()
+			// Track user orders 跟踪用户下单
+			odMgr.TrialUnMatchesForever()
+			// Consumption order queue 消费订单队列
+			odMgr.ConsumeOrderQueue()
+			// Monitor leverage changes 监听杠杆倍数变化
+			odMgr.WatchLeverages()
+		}
+		return
+	}
+	managers := accLiveOdMgrs
+	accounts := config.Accounts
+	for account, cfg := range accounts {
+		if cfg == nil || cfg.NoTrade {
 			continue
 		}
-		odMgr := GetLiveOdMgr(account)
+		odMgr := managers[account]
+		if odMgr == nil || !odMgr.setWorkerContext(ctx) {
+			continue
+		}
 		// Monitor account order flow 监听账户订单流
 		odMgr.WatchMyTrades()
 		// Track user orders 跟踪用户下单
@@ -3223,10 +4624,85 @@ func StartLiveOdMgr() {
 	}
 }
 
+// StopLiveOdMgr seals admission and cancels all live order workers.
+func StopLiveOdMgr() {
+	stopLiveOdMgr(nil)
+}
+
+// StopLiveOdMgrWithRuntimeDeps seals admission only for one runtime's live
+// managers.
+func StopLiveOdMgrWithRuntimeDeps(deps RuntimeDeps) {
+	requireRuntimeDeps(deps)
+	stopLiveOdMgr(&deps)
+}
+
+func stopLiveOdMgr(deps *RuntimeDeps) {
+	if deps != nil {
+		if deps.Trading == nil {
+			return
+		}
+		for _, odMgr := range deps.Trading.LiveManagersSnapshot() {
+			odMgr.Stop()
+		}
+		return
+	}
+	managers := accLiveOdMgrs
+	for _, odMgr := range managers {
+		odMgr.Stop()
+	}
+}
+
+// JoinLiveOdMgr waits for all live order workers after StopLiveOdMgr.
+func JoinLiveOdMgr() {
+	joinLiveOdMgr(nil)
+}
+
+// JoinLiveOdMgrWithRuntimeDeps waits only for one runtime's live managers.
+func JoinLiveOdMgrWithRuntimeDeps(deps RuntimeDeps) {
+	requireRuntimeDeps(deps)
+	joinLiveOdMgr(&deps)
+}
+
+func joinLiveOdMgr(deps *RuntimeDeps) {
+	if deps != nil {
+		if deps.Trading == nil {
+			return
+		}
+		for _, odMgr := range deps.Trading.LiveManagersSnapshot() {
+			odMgr.Join()
+		}
+		return
+	}
+	managers := accLiveOdMgrs
+	for _, odMgr := range managers {
+		odMgr.Join()
+	}
+}
+
 func logPutOrder(arg *exg.PutOrderRes) *errs.Error {
+	if arg == nil {
+		return nil
+	}
 	if arg.Err != nil {
 		return arg.Err
 	}
-	orm.AddDumpRow(orm.DumpApiOrder, arg.Symbol+arg.Order.ID, arg)
+	if arg.Order != nil {
+		orm.AddDumpRow(orm.DumpApiOrder, arg.Symbol+arg.Order.ID, arg)
+	}
 	return nil
+}
+
+func logPutOrderWithDump(sink *orm.DumpSink) func(*exg.PutOrderRes) *errs.Error {
+	return func(arg *exg.PutOrderRes) *errs.Error {
+		if arg == nil {
+			return nil
+		}
+		if arg.Err != nil {
+			return arg.Err
+		}
+		if sink != nil && arg.Order != nil {
+			sink.Add(orm.DumpApiOrder, arg.Symbol+arg.Order.ID, arg)
+		}
+		return nil
+	}
 }

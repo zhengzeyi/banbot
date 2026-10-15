@@ -2,13 +2,15 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/core"
@@ -25,7 +27,7 @@ import (
 
 func GetDataDir() string {
 	if DataDir == "" {
-		DataDir = getEnvPath("BanDataDir")
+		DataDir = ResolveDataDir("")
 		if DataDir == "" {
 			panic("env `BanDataDir` or args `-datadir` is required")
 		}
@@ -35,9 +37,28 @@ func GetDataDir() string {
 
 func GetDataDirSafe() string {
 	if DataDir == "" {
-		DataDir = getEnvPath("BanDataDir")
+		DataDir = ResolveDataDir("")
 	}
 	return DataDir
+}
+
+// ResolveDataDir returns an absolute data directory from an explicit value or
+// the BanDataDir environment variable. It does not read or mutate the legacy
+// package-level DataDir, so runtime composition can resolve directories
+// without installing process-wide configuration.
+func ResolveDataDir(explicit string) string {
+	value := strings.TrimSpace(explicit)
+	if value == "" {
+		value = strings.TrimSpace(os.Getenv("BanDataDir"))
+	}
+	if value == "" {
+		return ""
+	}
+	absPath, err := filepath.Abs(value)
+	if err != nil {
+		panic(err)
+	}
+	return strings.TrimSpace(absPath)
 }
 
 func GetLogsDir() string {
@@ -86,68 +107,21 @@ args: NoDefault, Configs, TimeRange, MaxPoolSize, StakeAmount, StakePct, TimeFra
 */
 func GetConfig(args *CmdArgs, showLog bool) (*Config, *errs.Error) {
 	args.Init()
-	var paths []string
-	if !args.NoDefault {
-		dataDir := GetDataDir()
-		if dataDir == "" {
-			return nil, errs.NewMsg(errs.CodeParamRequired, "-datadir or env `BanDataDir` is required")
-		}
-		tryNames := []string{"config.yml", "config.local.yml"}
-		for _, name := range tryNames {
-			path := filepath.Join(dataDir, name)
-			if _, err := os.Stat(path); err == nil {
-				paths = append(paths, path)
-			}
-		}
-	}
-	configPaths := args.Configs
-	if len(configPaths) > 0 {
-		paths = append(paths, configPaths...)
-	}
-
-	// Handle ConfigData if provided
-	if args.ConfigData != "" {
-		// Create temporary file for ConfigData
-		tmpFile, err := os.CreateTemp("", "config_data_*.yml")
-		if err != nil {
-			return nil, errs.New(errs.CodeIOReadFail, err)
-		}
-		tmpPath := tmpFile.Name()
-
-		// Write ConfigData to temporary file
-		if _, err := tmpFile.WriteString(args.ConfigData); err != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
-			return nil, errs.New(errs.CodeIOWriteFail, err)
-		}
-		tmpFile.Close()
-
-		// Add temporary file path to paths
-		paths = append(paths, tmpPath)
-
-		// Defer removal of temporary file
-		defer func() {
-			if err = os.Remove(tmpPath); err != nil {
-				log.Warn("Failed to remove temporary config file: " + err.Error())
-			}
-		}()
-	}
-
-	res, err2 := ParseConfigs(paths, showLog)
-	if err2 != nil {
-		return nil, err2
-	}
-	err := res.Apply(args)
+	spec, err := LoadRunSpec(args, showLog)
 	if err != nil {
-		return nil, errs.New(errs.CodeRunTime, err)
+		return nil, err
 	}
-	return res, nil
+	return spec.Config().TimeSeriesConfig()
 }
 
 func UpdateLocal(configPaths []string, configData string, noDefault bool) *errs.Error {
 	// 对于docker中启动，且传入了额外yml配置的，合并写入到config.local.yml，方便WebUI启动回测时保留额外的yml配置
 	items := make([]string, 0, len(configPaths)+1)
 	localCfgPath := filepath.Join(GetDataDir(), "config.local.yml")
+	expected, readErr := os.ReadFile(localCfgPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return errs.New(errs.CodeIOReadFail, readErr)
+	}
 	if _, err := os.Stat(localCfgPath); err == nil && !noDefault {
 		items = append(items, localCfgPath)
 	}
@@ -181,72 +155,19 @@ func UpdateLocal(configPaths []string, configData string, noDefault bool) *errs.
 	if err != nil {
 		return errs.New(errs.CodeIOReadFail, err)
 	}
-	err2 := utils2.WriteFile(localCfgPath, []byte(content))
-	if err2 != nil {
-		return err2
+	if _, err := ParseUnifiedYAML([]byte(content), localCfgPath); err != nil {
+		return err
 	}
-	return nil
+	return WriteConfigAtomic(localCfgPath, expected, []byte(content))
 }
 
 func ParseConfigs(paths []string, showLog bool) (*Config, *errs.Error) {
-	var res Config
-	var merged = make(map[string]interface{})
-	var llmMerged map[string]interface{}
-	for _, path := range paths {
-		if showLog {
-			log.Info("Using " + path)
-		}
-		rawData, err := os.ReadFile(ParsePath(path))
-		if err != nil {
-			return nil, errs.NewFull(core.ErrIOReadFail, err, "Read %s Fail", path)
-		}
-		llmSection, err := extractLLMSection(rawData)
-		if err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Parse LLM config from %s Fail", path)
-		}
-		if llmSection != nil {
-			if llmMerged == nil {
-				llmMerged = make(map[string]interface{})
-			}
-			utils2.DeepCopyMap(llmMerged, llmSection)
-		}
-
-		fileData := []byte(os.ExpandEnv(string(rawData)))
-		var unpak map[string]interface{}
-		err = yaml.Unmarshal(fileData, &unpak)
-		if err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Unmarshal %s Fail", path)
-		}
-		if _, ok := unpak["timerange"]; ok {
-			delete(merged, "time_start")
-			delete(merged, "time_end")
-		} else if _, hasStart := unpak["time_start"]; hasStart {
-			delete(merged, "timerange")
-		} else if _, hasEnd := unpak["time_end"]; hasEnd {
-			delete(merged, "timerange")
-		}
-		for key := range noExtends {
-			if _, ok := unpak[key]; ok {
-				delete(merged, key)
-			}
-		}
-		utils2.DeepCopyMap(merged, unpak)
-	}
-	err := mapstructure.Decode(merged, &res)
+	unified, err := ParseUnifiedConfigs(paths, showLog)
 	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode Config Fail")
+		return nil, err
 	}
-	if llmMerged != nil {
-		if err := applyLLMConfig(llmMerged, &res); err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode LLM config Fail")
-		}
-	}
-	if err := llm.ResolveModels(res.LLMModels); err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
-	}
-	return &res, nil
+	return unified.TimeSeriesConfig()
 }
-
 func ParseConfig(path string) (*Config, *errs.Error) {
 	fileData, err := os.ReadFile(ParsePath(path))
 	if err != nil {
@@ -256,32 +177,12 @@ func ParseConfig(path string) (*Config, *errs.Error) {
 }
 
 func ParseYmlConfig(fileData []byte, path string) (*Config, *errs.Error) {
-	var res Config
-	llmSection, err := extractLLMSection(fileData)
+	unified, err := ParseUnifiedYAML(fileData, path)
 	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Parse LLM config from %s Fail", path)
+		return nil, err
 	}
-	fileData = []byte(os.ExpandEnv(string(fileData)))
-	var unpak map[string]interface{}
-	err = yaml.Unmarshal(fileData, &unpak)
-	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "Unmarshal %s Fail", path)
-	}
-	err = mapstructure.Decode(unpak, &res)
-	if err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode Config Fail")
-	}
-	if llmSection != nil {
-		if err := applyLLMConfig(llmSection, &res); err != nil {
-			return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "decode LLM config Fail")
-		}
-	}
-	if err := llm.ResolveModels(res.LLMModels); err != nil {
-		return nil, errs.NewFull(errs.CodeUnmarshalFail, err, "resolve LLM config Fail")
-	}
-	return &res, nil
+	return unified.TimeSeriesConfig()
 }
-
 func extractLLMSection(rawData []byte) (map[string]interface{}, error) {
 	var unpak map[string]interface{}
 	if err := yaml.Unmarshal(rawData, &unpak); err != nil {
@@ -364,19 +265,7 @@ func MergeConfigPaths(paths []string, skips ...string) (string, error) {
 }
 
 func (c *Config) Apply(args *CmdArgs) error {
-	if args.TimeRange != "" {
-		c.TimeRangeRaw = args.TimeRange
-		c.TimeStart = ""
-		c.TimeEnd = ""
-	}
-	if args.TimeStart != "" {
-		c.TimeStart = args.TimeStart
-		c.TimeEnd = args.TimeEnd
-		c.TimeRangeRaw = ""
-	}
-	if args.MaxPoolSize > 0 {
-		c.Database.MaxPoolSize = args.MaxPoolSize
-	}
+	c.applyArguments(args)
 	var start, stop = int64(0), int64(0)
 	var err error
 	if c.TimeStart != "" {
@@ -401,30 +290,60 @@ func (c *Config) Apply(args *CmdArgs) error {
 		return fmt.Errorf("`time_start` in yml is required")
 	}
 	c.TimeRange = &TimeTuple{start, stop}
-	if args.StakeAmount > 0 {
+	if c.HistoricalCoverage != nil {
+		return c.HistoricalCoverage.Normalize(c.TimeRange)
+	}
+	return nil
+}
+
+func (c *Config) applyArguments(args *CmdArgs) {
+	if args.BTStrictSet || args.ExplicitFlags["bt-strict"] {
+		c.BTStrict = args.BTStrict
+	}
+	if args.TimeRange != "" || args.ExplicitFlags["timerange"] {
+		c.TimeRangeRaw = args.TimeRange
+		c.TimeStart = ""
+		c.TimeEnd = ""
+	}
+	if args.TimeStart != "" || args.ExplicitFlags["timestart"] {
+		c.TimeStart = args.TimeStart
+		c.TimeEnd = args.TimeEnd
+		c.TimeRangeRaw = ""
+	}
+	if args.MaxPoolSize > 0 {
+		if c.Database == nil {
+			c.Database = &DatabaseConfig{}
+		}
+		c.Database.MaxPoolSize = args.MaxPoolSize
+	}
+	if args.StakeAmount > 0 || args.ExplicitFlags["stake-amount"] {
 		c.StakeAmount = args.StakeAmount
 	}
-	if args.StakePct > 0 {
+	if args.StakePct > 0 || args.ExplicitFlags["stake-pct"] {
 		c.StakePct = args.StakePct
 	}
 	// Parse TimeFrames field and populate RunTimeframes
 	if c.TimeFrames != "" && len(c.RunTimeframes) == 0 {
 		c.RunTimeframes = SplitTimeFrames(c.TimeFrames)
 	}
-	if len(args.TimeFrames) > 0 {
+	if len(args.TimeFrames) > 0 || args.ExplicitFlags["timeframes"] {
 		c.RunTimeframes = args.TimeFrames
 	}
-	if len(args.Pairs) > 0 {
+	if len(args.Pairs) > 0 || args.ExplicitFlags["pairs"] {
 		c.Pairs = args.Pairs
 	}
-	return nil
 }
 
 func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
+	if err := validateTimeSeriesPolicies(c.RunPolicy); err != nil {
+		return err
+	}
 	Loaded = true
 	Name = c.Name
 	Args = args
+	runtimeAccounts := c.Accounts
 	Data = *c
+	Data.Accounts = cloneAccountConfigs(runtimeAccounts)
 	if args.DataDir != "" {
 		DataDir = args.DataDir
 	}
@@ -492,6 +411,7 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 	}
 	LowCostAction = c.LowCostAction
 	BTNetCost = c.BTNetCost
+	HistoricalCoverage = c.HistoricalCoverage
 	if BTNetCost == 0 {
 		BTNetCost = 15
 	}
@@ -580,7 +500,7 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 			return setErr
 		}
 	}
-	err = initExgAccs(args, c.Accounts)
+	err = initExgAccs(args, runtimeAccounts)
 	if err != nil {
 		return err
 	}
@@ -605,6 +525,9 @@ func ApplyConfig(args *CmdArgs, c *Config) *errs.Error {
 
 // SetRunPolicy set run_policy and their indexs
 func SetRunPolicy(index bool, items ...*RunPolicyConfig) *errs.Error {
+	if err := validateTimeSeriesPolicies(items); err != nil {
+		return err
+	}
 	if items == nil {
 		items = make([]*RunPolicyConfig, 0)
 	}
@@ -659,17 +582,30 @@ func SetRunPolicy(index bool, items ...*RunPolicyConfig) *errs.Error {
 
 // GetStaticPairs 合并pairs和run_policy.pairs返回，bool表示是否需要动态计算
 func GetStaticPairs() ([]string, bool) {
-	var res = make([]string, 0, len(Pairs))
-	res = append(res, Pairs...)
+	return Data.StaticPairs()
+}
+
+// StaticPairs returns this immutable configuration's explicit pair set and
+// whether a policy still requires dynamic pair discovery.
+func (c *Config) StaticPairs() ([]string, bool) {
+	if c == nil {
+		return nil, false
+	}
+	var res = make([]string, 0, len(c.Pairs))
+	res = append(res, c.Pairs...)
 	needCalc := false
-	for _, p := range RunPolicy {
+	for _, p := range c.RunPolicy {
+		if p == nil {
+			needCalc = true
+			continue
+		}
 		if len(p.Pairs) > 0 {
 			res = append(res, p.Pairs...)
 		} else {
 			needCalc = true
 		}
 	}
-	if len(Pairs) > 0 {
+	if len(c.Pairs) > 0 {
 		needCalc = false
 	}
 	if len(res) == 0 {
@@ -680,10 +616,8 @@ func GetStaticPairs() ([]string, bool) {
 }
 
 func GetTakeOverTF(pair, defTF string) string {
-	if pairMap, ok := core.StgPairTfs[TakeOverStrat]; ok {
-		if tf, ok := pairMap[pair]; ok {
-			return tf
-		}
+	if tf, ok := core.LegacyStrategyTimeFrame(TakeOverStrat, pair); ok {
+		return tf
 	}
 	return defTF
 }
@@ -704,8 +638,8 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 	}
 	if loc != nil {
 		btime.LocShow = loc
-	} else if Exchange.Name == "china" {
-		btime.LocShow, _ = time.LoadLocation("Asia/Shanghai")
+	} else if location := ExchangeDefaultLocation(Exchange.Name); location != nil {
+		btime.LocShow = location
 	} else {
 		btime.LocShow = btime.UTCLocale
 	}
@@ -713,14 +647,18 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 	BakAccounts = make(map[string]*AccountConfig)
 	if core.EnvReal {
 		DefAcc = ""
+	} else {
+		DefAcc = "default"
 	}
-	for name, val := range accs {
+	for _, name := range slices.Sorted(maps.Keys(accs)) {
+		val := accs[name]
 		if val.NoTrade {
 			BakAccounts[name] = val
 		} else if !core.EnvReal {
-			// Non-production environment, only enable one account
-			// 非生产环境，只启用一个账号
-			Accounts[DefAcc] = val
+			// Prefer an explicitly named default account, otherwise use the first name.
+			if _, exists := Accounts[DefAcc]; !exists || name == DefAcc {
+				Accounts[DefAcc] = val
+			}
 		} else {
 			Accounts[name] = val
 			if DefAcc == "" {
@@ -738,6 +676,22 @@ func initExgAccs(args *CmdArgs, accs map[string]*AccountConfig) *errs.Error {
 		Accounts[DefAcc] = &AccountConfig{}
 	}
 	return nil
+}
+
+func StrictBacktest() bool {
+	return core.BackTestMode && Data.BTStrict
+}
+
+// IsFrozenStaticPairs reports whether strict replay may use the submitted
+// static universe without discovering market data or applying pair filters.
+func IsFrozenStaticPairs(pairs []string) bool {
+	return len(pairs) > 0 && len(PairFilters) == 0 &&
+		(PairMgr == nil || !PairMgr.ForceFilters) &&
+		StrictBacktest() && Data.BTNoKlineDownload
+}
+
+func StrictHistoricalReplay(coverage *HistoricalCoverageConfig) bool {
+	return StrictBacktest() && Data.BTNoKlineDownload && coverage != nil
 }
 
 func (p *StratPerfConfig) Validate() {
@@ -874,56 +828,93 @@ func (c *Config) ShowPairs() string {
 }
 
 func (c *Config) Clone() *Config {
-	return &Config{
-		Name:             c.Name,
-		Env:              c.Env,
-		Leverage:         c.Leverage,
-		LimitVolSecs:     c.LimitVolSecs,
-		PutLimitSecs:     c.PutLimitSecs,
-		AccountPullSecs:  c.AccountPullSecs,
-		MarketType:       c.MarketType,
-		ContractType:     c.ContractType,
-		OdBookTtl:        c.OdBookTtl,
-		StopEnterBars:    c.StopEnterBars,
-		ConcurNum:        c.ConcurNum,
-		OrderType:        c.OrderType,
-		PreFire:          c.PreFire,
-		MarginAddRate:    c.MarginAddRate,
-		ChargeOnBomb:     c.ChargeOnBomb,
-		TakeOverStrat:    c.TakeOverStrat,
-		StakeAmount:      c.StakeAmount,
-		StakePct:         c.StakePct,
-		MaxStakeAmt:      c.MaxStakeAmt,
-		OpenVolRate:      c.OpenVolRate,
-		MinOpenRate:      c.MinOpenRate,
-		LowCostAction:    c.LowCostAction,
-		BTNetCost:        c.BTNetCost,
-		RelaySimUnFinish: c.RelaySimUnFinish,
-		OrderBarMax:      c.OrderBarMax,
-		MaxOpenOrders:    c.MaxOpenOrders,
-		MaxSimulOpen:     c.MaxSimulOpen,
-		WalletAmounts:    c.WalletAmounts,
-		DrawBalanceOver:  c.DrawBalanceOver,
-		StakeCurrency:    c.StakeCurrency,
-		FatalStop:        c.FatalStop,
-		FatalStopHours:   c.FatalStopHours,
-		TimeRangeRaw:     c.TimeRangeRaw,
-		TimeStart:        c.TimeStart,
-		TimeEnd:          c.TimeEnd,
-		TimeRange:        c.TimeRange,
-		RunTimeframes:    c.RunTimeframes,
-		KlineSource:      c.KlineSource,
-		WatchJobs:        c.WatchJobs,
-		RunPolicy:        c.RunPolicy,
-		StratPerf:        c.StratPerf,
-		Pairs:            c.Pairs,
-		PairMgr:          c.PairMgr,
-		PairFilters:      c.PairFilters,
-		SpiderAddr:       c.SpiderAddr,
-		Webhook:          c.Webhook,
-		Accounts:         c.Accounts,
-		Exchange:         c.Exchange,
+	res := &Config{
+		Name:                 c.Name,
+		Env:                  c.Env,
+		Leverage:             c.Leverage,
+		LimitVolSecs:         c.LimitVolSecs,
+		PutLimitSecs:         c.PutLimitSecs,
+		AccountPullSecs:      c.AccountPullSecs,
+		MarketType:           c.MarketType,
+		ContractType:         c.ContractType,
+		OdBookTtl:            c.OdBookTtl,
+		StopEnterBars:        c.StopEnterBars,
+		ConcurNum:            c.ConcurNum,
+		OrderType:            c.OrderType,
+		PreFire:              c.PreFire,
+		MarginAddRate:        c.MarginAddRate,
+		ChargeOnBomb:         c.ChargeOnBomb,
+		TakeOverStrat:        c.TakeOverStrat,
+		CloseOnStuck:         c.CloseOnStuck,
+		StakeAmount:          c.StakeAmount,
+		StakePct:             c.StakePct,
+		MaxStakeAmt:          c.MaxStakeAmt,
+		OpenVolRate:          c.OpenVolRate,
+		MinOpenRate:          c.MinOpenRate,
+		LowCostAction:        c.LowCostAction,
+		BTNetCost:            c.BTNetCost,
+		BTLegacyIntrabar:     c.BTLegacyIntrabar,
+		BTLegacyOrderMetrics: c.BTLegacyOrderMetrics,
+		BTLegacyWallet:       c.BTLegacyWallet,
+		BTNoKlineDownload:    c.BTNoKlineDownload,
+		BTStrict:             c.BTStrict,
+		HistoricalCoverage:   c.HistoricalCoverage.Clone(),
+		RelaySimUnFinish:     c.RelaySimUnFinish,
+		NTPLangCode:          c.NTPLangCode,
+		ShowLangCode:         c.ShowLangCode,
+		OrderBarMax:          c.OrderBarMax,
+		MaxOpenOrders:        c.MaxOpenOrders,
+		MaxSimulOpen:         c.MaxSimulOpen,
+		WalletAmounts:        c.WalletAmounts,
+		DrawBalanceOver:      c.DrawBalanceOver,
+		StakeCurrency:        c.StakeCurrency,
+		FatalStop:            c.FatalStop,
+		FatalStopHours:       c.FatalStopHours,
+		TimeRangeRaw:         c.TimeRangeRaw,
+		TimeStart:            c.TimeStart,
+		TimeEnd:              c.TimeEnd,
+		TimeRange:            c.TimeRange,
+		TimeFrames:           c.TimeFrames,
+		RunTimeframes:        c.RunTimeframes,
+		KlineSource:          c.KlineSource,
+		WatchJobs:            c.WatchJobs,
+		RunPolicy:            c.RunPolicy,
+		StratPerf:            c.StratPerf,
+		Pairs:                c.Pairs,
+		PairMgr:              c.PairMgr,
+		PairFilters:          c.PairFilters,
+		SpiderAddr:           c.SpiderAddr,
+		Webhook:              c.Webhook,
+		Accounts:             c.Accounts,
+		Exchange:             c.Exchange,
 	}
+	if c.BTInLive != nil {
+		item := *c.BTInLive
+		item.MailTo = slices.Clone(c.BTInLive.MailTo)
+		res.BTInLive = &item
+	}
+	if c.Database != nil {
+		item := *c.Database
+		res.Database = &item
+	}
+	if c.LLMModels != nil {
+		res.LLMModels = make(map[string]*llm.LLMModelConfig, len(c.LLMModels))
+		for name, model := range c.LLMModels {
+			if model == nil {
+				res.LLMModels[name] = nil
+				continue
+			}
+			item := *model
+			item.Extend = cloneConfigValue(model.Extend)
+			item.Payload = cloneStringMap(model.Payload)
+			if model.Temperature != nil {
+				temperature := *model.Temperature
+				item.Temperature = &temperature
+			}
+			res.LLMModels[name] = &item
+		}
+	}
+	return res
 }
 
 /*
@@ -934,38 +925,35 @@ exchange.account_*.*.(api_key|api_secret)
 rpc_channels.*.*secret
 api_server.jwt_secret_key
 api_server.users[*].pwd
+llm_models.*.api_key
 */
 func (c *Config) Desensitize() *Config {
 	var res = c.Clone()
 
-	if res.Accounts != nil {
-		for _, acc := range res.Accounts {
-			acc.Exchanges = nil
-			acc.APIServer = nil
+	res.Accounts = cloneAccountConfigs(c.Accounts)
+	for _, account := range res.Accounts {
+		if account != nil {
+			account.Exchanges = nil
+			account.APIServer = nil
 		}
 	}
 
 	// 处理数据库配置
 	if c.Database != nil {
-		res.Database = &DatabaseConfig{
-			Url:         "",
-			Retention:   c.Database.Retention,
-			MaxPoolSize: c.Database.MaxPoolSize,
-			AutoCreate:  c.Database.AutoCreate,
-			QdbMemPct:   c.Database.QdbMemPct,
-			QdbMaxMemMB: c.Database.QdbMaxMemMB,
-		}
+		item := *c.Database
+		item.Url = ""
+		res.Database = &item
 	}
 
 	// 处理RPC通道配置
 	if c.RPCChannels != nil {
-		res.RPCChannels = make(map[string]map[string]interface{})
+		res.RPCChannels = make(map[string]map[string]interface{}, len(c.RPCChannels))
 		for channelName, channelConfig := range c.RPCChannels {
 			chlType := utils.GetMapVal(channelConfig, "type", "")
-			resChannel := make(map[string]interface{})
-			for k, v := range channelConfig {
-				if !strings.Contains(strings.ToLower(k), "secret") {
-					resChannel[k] = v
+			resChannel := cloneStringMap(channelConfig)
+			for key := range resChannel {
+				if strings.Contains(strings.ToLower(key), "secret") {
+					delete(resChannel, key)
 				}
 			}
 			if chlType == "wework" {
@@ -982,22 +970,26 @@ func (c *Config) Desensitize() *Config {
 
 	// 处理API服务器配置
 	if c.APIServer != nil {
-		res.APIServer = &APIServerConfig{
-			Enable:      c.APIServer.Enable,
-			BindIPAddr:  c.APIServer.BindIPAddr,
-			Port:        c.APIServer.Port,
-			Verbosity:   c.APIServer.Verbosity,
-			CORSOrigins: c.APIServer.CORSOrigins,
-		}
+		item := *c.APIServer
+		item.JWTSecretKey = ""
+		item.CORSOrigins = slices.Clone(c.APIServer.CORSOrigins)
 		if c.APIServer.Users != nil {
-			res.APIServer.Users = make([]*UserConfig, len(c.APIServer.Users))
+			item.Users = make([]*UserConfig, len(c.APIServer.Users))
 			for i, user := range c.APIServer.Users {
-				res.APIServer.Users[i] = &UserConfig{
-					Username:    user.Username,
-					AccRoles:    user.AccRoles,
-					ExpireHours: user.ExpireHours,
+				if user != nil {
+					userCopy := *user
+					userCopy.Password = ""
+					userCopy.AllowIPs = slices.Clone(user.AllowIPs)
+					userCopy.AccRoles = maps.Clone(user.AccRoles)
+					item.Users[i] = &userCopy
 				}
 			}
+		}
+		res.APIServer = &item
+	}
+	for _, model := range res.LLMModels {
+		if model != nil {
+			model.APIKey = ""
 		}
 	}
 
@@ -1130,69 +1122,181 @@ func (c *RunPolicyConfig) KeepHyperOnly(keys ...string) {
 }
 
 func (c *RunPolicyConfig) ToYaml() string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("  - name: %s\n", c.Name))
-	if c.Dirt != "" {
-		b.WriteString(fmt.Sprintf("    dirt: %s\n", c.Dirt))
+	data, err := core.MarshalYaml([]*RunPolicyConfig{c})
+	if err != nil {
+		panic(fmt.Sprintf("marshal run policy fail: %v", err))
 	}
-	if len(c.RunTimeframes) > 0 {
-		b.WriteString(fmt.Sprintf("    run_timeframes: [ %s ]\n", strings.Join(c.RunTimeframes, ", ")))
-	}
-	if len(c.Pairs) > 0 {
-		b.WriteString(fmt.Sprintf("    pairs: [ %s ]\n", strings.Join(c.Pairs, ", ")))
-	}
-	argText := utils2.MapToStr(c.Params, true, 2)
-	if len(c.Pairs) == 1 {
-		b.WriteString("    pair_params:\n")
-		b.WriteString(fmt.Sprintf("      %s: {%s}\n", c.Pairs[0], argText))
-	} else {
-		b.WriteString(fmt.Sprintf("    params: {%s}\n", argText))
-	}
-	return b.String()
+	text := strings.TrimSuffix(string(data), "\n")
+	return "  " + strings.ReplaceAll(text, "\n", "\n  ") + "\n"
 }
 
 func (c *RunPolicyConfig) Clone() *RunPolicyConfig {
-	res := &RunPolicyConfig{
-		Index:         c.Index,
-		Name:          c.Name,
-		Filters:       c.Filters,
-		RunTimeframes: c.RunTimeframes,
-		MaxPair:       c.MaxPair,
-		MaxOpen:       c.MaxOpen,
-		MaxSimulOpen:  c.MaxSimulOpen,
-		Dirt:          c.Dirt,
-		StratPerf:     c.StratPerf,
-		Pairs:         c.Pairs,
-		Params:        make(map[string]float64),
-		PairParams:    make(map[string]map[string]float64),
-		More:          make(map[string]interface{}),
-		defs:          make(map[string]*core.Param),
+	res := *c
+	res.RunTimeframes = slices.Clone(c.RunTimeframes)
+	res.Pairs = slices.Clone(c.Pairs)
+	res.Params = maps.Clone(c.Params)
+	res.PairParams = make(map[string]map[string]float64, len(c.PairParams))
+	for pair, params := range c.PairParams {
+		res.PairParams[pair] = maps.Clone(params)
 	}
-	if len(c.Params) > 0 {
-		for k, v := range c.Params {
-			res.Params[k] = v
+	res.Filters = make([]*CommonPairFilter, len(c.Filters))
+	for i, filter := range c.Filters {
+		if filter != nil {
+			item := *filter
+			item.Items = cloneStringMap(filter.Items)
+			res.Filters[i] = &item
 		}
 	}
-	if len(c.PairParams) > 0 {
-		for k, mp := range c.PairParams {
-			pairPms := make(map[string]float64)
-			for k2, v := range mp {
-				pairPms[k2] = v
-			}
-			res.PairParams[k] = pairPms
+	if c.StratPerf != nil {
+		item := *c.StratPerf
+		res.StratPerf = &item
+	}
+	res.More = cloneStringMap(c.More)
+	res.defs = make(map[string]*core.Param, len(c.defs))
+	for name, def := range c.defs {
+		if def != nil {
+			item := *def
+			res.defs[name] = &item
 		}
 	}
-	if len(c.More) > 0 {
-		for k, v := range c.More {
-			res.More[k] = v
-		}
+	return &res
+}
+
+func cloneStringMap(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
 	}
-	if len(c.defs) > 0 {
-		for k, v := range c.defs {
-			res.defs[k] = v
-		}
+	res := make(map[string]interface{}, len(src))
+	for key, val := range src {
+		res[key] = cloneConfigValue(val)
 	}
 	return res
+}
+
+func cloneAccountConfigs(src map[string]*AccountConfig) map[string]*AccountConfig {
+	return cloneAccountConfigsWithStake(src, false)
+}
+
+// CloneAccountConfigsForRuntime copies account configuration for a Runtime
+// owner while preserving the execution-owned stake amount. The ordinary
+// configuration snapshot intentionally clears StakePctAmt because that field
+// is mutable runtime state in the legacy/hyper-opt lifecycle.
+func CloneAccountConfigsForRuntime(src map[string]*AccountConfig) map[string]*AccountConfig {
+	return cloneAccountConfigsWithStake(src, true)
+}
+
+func cloneAccountConfigsWithStake(src map[string]*AccountConfig, preserveStakePctAmt bool) map[string]*AccountConfig {
+	if src == nil {
+		return nil
+	}
+	res := make(map[string]*AccountConfig, len(src))
+	for name, account := range src {
+		if account == nil {
+			res[name] = nil
+			continue
+		}
+		item := *account
+		if !preserveStakePctAmt {
+			item.StakePctAmt = 0
+		}
+		item.RPCChannels = make([]map[string]interface{}, len(account.RPCChannels))
+		for i, channel := range account.RPCChannels {
+			item.RPCChannels[i] = cloneStringMap(channel)
+		}
+		if account.APIServer != nil {
+			apiServer := *account.APIServer
+			item.APIServer = &apiServer
+		}
+		if account.Exchanges != nil {
+			item.Exchanges = make(map[string]*ExgApiSecrets, len(account.Exchanges))
+			for exchange, secrets := range account.Exchanges {
+				if secrets == nil {
+					item.Exchanges[exchange] = nil
+					continue
+				}
+				secretCopy := &ExgApiSecrets{}
+				if secrets.Prod != nil {
+					prod := *secrets.Prod
+					secretCopy.Prod = &prod
+				}
+				if secrets.Test != nil {
+					test := *secrets.Test
+					secretCopy.Test = &test
+				}
+				item.Exchanges[exchange] = secretCopy
+			}
+		}
+		res[name] = &item
+	}
+	return res
+}
+
+func cloneConfigValue(val interface{}) interface{} {
+	cloned := cloneConfigReflect(reflect.ValueOf(val))
+	if !cloned.IsValid() {
+		return nil
+	}
+	return cloned.Interface()
+}
+
+func cloneConfigReflect(val reflect.Value) reflect.Value {
+	if !val.IsValid() || !val.CanInterface() {
+		return val
+	}
+	switch val.Kind() {
+	case reflect.Interface:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.New(val.Type()).Elem()
+		res.Set(cloneConfigReflect(val.Elem()))
+		return res
+	case reflect.Map:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.MakeMapWithSize(val.Type(), val.Len())
+		iter := val.MapRange()
+		for iter.Next() {
+			res.SetMapIndex(cloneConfigReflect(iter.Key()), cloneConfigReflect(iter.Value()))
+		}
+		return res
+	case reflect.Slice:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.MakeSlice(val.Type(), val.Len(), val.Len())
+		for i := 0; i < val.Len(); i++ {
+			res.Index(i).Set(cloneConfigReflect(val.Index(i)))
+		}
+		return res
+	case reflect.Array:
+		res := reflect.New(val.Type()).Elem()
+		for i := 0; i < val.Len(); i++ {
+			res.Index(i).Set(cloneConfigReflect(val.Index(i)))
+		}
+		return res
+	case reflect.Ptr:
+		if val.IsNil() {
+			return reflect.Zero(val.Type())
+		}
+		res := reflect.New(val.Type().Elem())
+		res.Elem().Set(cloneConfigReflect(val.Elem()))
+		return res
+	case reflect.Struct:
+		res := reflect.New(val.Type()).Elem()
+		res.Set(val)
+		for i := 0; i < val.NumField(); i++ {
+			src, dst := val.Field(i), res.Field(i)
+			if !src.CanInterface() || !dst.CanSet() {
+				continue
+			}
+			dst.Set(cloneConfigReflect(src))
+		}
+		return res
+	default:
+		return val
+	}
 }
 
 func (c *RunPolicyConfig) PairDup(pair string) (*RunPolicyConfig, bool) {
@@ -1207,23 +1311,44 @@ func (c *RunPolicyConfig) PairDup(pair string) (*RunPolicyConfig, bool) {
 	return res, isDiff
 }
 
-func (a *AccountConfig) GetApiSecret() *ApiSecretConfig {
+// GetApiSecretFor selects credentials using the supplied exchange and
+// environment. Explicit Runtime construction must use this method so it does
+// not depend on the process-wide config.Exchange or core.RunEnv values.
+func (a *AccountConfig) GetApiSecretFor(exchangeName, env string) *ApiSecretConfig {
 	if a == nil || len(a.Exchanges) == 0 {
 		return &ApiSecretConfig{}
 	}
-	cfg, _ := a.Exchanges[Exchange.Name]
+	cfg, _ := a.Exchanges[exchangeName]
 	if cfg != nil {
-		if core.RunEnv != core.RunEnvTest && cfg.Prod != nil {
+		if env != core.RunEnvTest && cfg.Prod != nil {
 			return cfg.Prod
-		} else if core.RunEnv == core.RunEnvTest && cfg.Test != nil {
+		} else if env == core.RunEnvTest && cfg.Test != nil {
 			return cfg.Test
 		}
 	}
 	return &ApiSecretConfig{}
 }
 
+// GetApiSecret is the legacy facade. New Runtime code should pass its own
+// exchange and environment to GetApiSecretFor instead.
+func (a *AccountConfig) GetApiSecret() *ApiSecretConfig {
+	exchangeName := ""
+	if Exchange != nil {
+		exchangeName = Exchange.Name
+	}
+	return a.GetApiSecretFor(exchangeName, core.RunEnv)
+}
+
 func LoadPerfs(inDir string) {
-	if StratPerf == nil || !StratPerf.Enable {
+	LoadPerfsWithCoreState(inDir, nil, StratPerf)
+}
+
+// LoadPerfsWithCoreState loads persisted strategy performance into the
+// supplied runtime state. Passing a non-nil state and configuration keeps an
+// explicit run independent from the process-wide performance facade; nil
+// state retains the legacy behavior.
+func LoadPerfsWithCoreState(inDir string, state *core.State, perfCfg *StratPerfConfig) {
+	if perfCfg == nil || !perfCfg.Enable {
 		return
 	}
 	inPath := fmt.Sprintf("%s/strat_perfs.yml", inDir)
@@ -1242,14 +1367,16 @@ func LoadPerfs(inDir string) {
 		log.Error("unmarshal strat_perfs fail", zap.Error(err_))
 		return
 	}
+	loadedSta := make(map[string]*core.PerfSta, len(unpak))
+	loadedPerfs := make(map[string]*core.JobPerf)
 	for strat, cfg := range unpak {
 		sta := &core.PerfSta{}
-		err_ = mapstructure.Decode(cfg, &sta)
+		err_ = mapstructure.Decode(cfg, sta)
 		if err_ != nil {
 			log.Error(fmt.Sprintf("decode %s fail", strat), zap.Error(err_))
 			continue
 		}
-		core.StratPerfSta[strat] = sta
+		loadedSta[strat] = sta
 		perfVal, ok := cfg["perf"]
 		if ok && perfVal != nil {
 			var perf = map[string]string{}
@@ -1260,16 +1387,39 @@ func LoadPerfs(inDir string) {
 			}
 			for pairTf, arrStr := range perf {
 				arr := strings.Split(arrStr, "|")
+				if len(arr) < 3 {
+					log.Error(fmt.Sprintf("decode %s.%s fail: invalid performance value", strat, pairTf))
+					continue
+				}
 				num, _ := strconv.Atoi(arr[0])
 				profit, _ := strconv.ParseFloat(arr[1], 64)
 				score, _ := strconv.ParseFloat(arr[2], 64)
-				core.JobPerfs[fmt.Sprintf("%s_%s", strat, pairTf)] = &core.JobPerf{
+				loadedPerfs[fmt.Sprintf("%s_%s", strat, pairTf)] = &core.JobPerf{
 					Num:       num,
 					TotProfit: profit,
 					Score:     score,
 				}
 			}
 		}
+	}
+	if state != nil {
+		state.WithPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+			for key, sta := range loadedSta {
+				stratPerfSta[key] = sta
+			}
+			for key, perf := range loadedPerfs {
+				jobPerfs[key] = perf
+			}
+		})
+	} else {
+		core.WithLegacyPerformance(func(jobPerfs map[string]*core.JobPerf, stratPerfSta map[string]*core.PerfSta) {
+			for key, sta := range loadedSta {
+				stratPerfSta[key] = sta
+			}
+			for key, perf := range loadedPerfs {
+				jobPerfs[key] = perf
+			}
+		})
 	}
 	log.Info("load strat_perfs ok", zap.String("path", inPath))
 }
@@ -1377,7 +1527,10 @@ func MergeAccounts() map[string]*AccountConfig {
 }
 
 func ReadLangFile(lang, name string) (string, error) {
-	resDir := GetDataDir()
+	return ReadLangFileFrom(GetDataDir(), lang, name)
+}
+
+func ReadLangFileFrom(resDir, lang, name string) (string, error) {
 	path := filepath.Join(resDir, lang, name)
 	if !utils2.Exists(path) {
 		path2 := filepath.Join(resDir, "en-US", name)
@@ -1479,12 +1632,20 @@ func SplitTimeFrames(timeframes string) []string {
 
 // ParsePairs parse short pairs to standard pair format
 func ParsePairs(pairs ...string) ([]string, *errs.Error) {
-	if core.ExgName == "china" {
-		return pairs, nil
+	exchangeName := core.ExgName
+	if Exchange != nil && Exchange.Name != "" {
+		exchangeName = Exchange.Name
+	}
+	return parsePairs(exchangeName, core.Market, StakeCurrency, pairs...)
+}
+
+func parsePairs(exchangeName, market string, stakeCurrency []string, pairs ...string) ([]string, *errs.Error) {
+	if ExchangeUsesOpaqueSymbols(exchangeName) {
+		return slices.Clone(pairs), nil
 	}
 	quote := ""
-	if len(StakeCurrency) > 0 {
-		quote = StakeCurrency[0]
+	if len(stakeCurrency) > 0 {
+		quote = stakeCurrency[0]
 	}
 	var result = make([]string, 0, len(pairs))
 	for _, p := range pairs {
@@ -1494,11 +1655,11 @@ func ParsePairs(pairs ...string) ([]string, *errs.Error) {
 		} else if quote == "" {
 			return nil, errs.NewMsg(core.ErrBadConfig, "`stake_currency` is required")
 		}
-		if core.Market == banexg.MarketSpot {
+		if market == banexg.MarketSpot {
 			result = append(result, fmt.Sprintf("%s/%s", p, quote))
-		} else if core.Market == banexg.MarketLinear {
+		} else if market == banexg.MarketLinear {
 			result = append(result, fmt.Sprintf("%s/%s:%s", p, quote, quote))
-		} else if core.Market == banexg.MarketInverse {
+		} else if market == banexg.MarketInverse {
 			result = append(result, fmt.Sprintf("%s/%s:%s", p, quote, p))
 		} else {
 			return nil, errs.NewMsg(core.ErrBadConfig, "option market don't support short pair")

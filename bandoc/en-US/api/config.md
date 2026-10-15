@@ -2,11 +2,16 @@
 
 The config package provides system configuration-related structures and methods.
 
+## Runtime Configuration
+
+Normal entry points parse configuration and then create a task-owned `config.Snapshot`. A Snapshot deep-copies the configuration and keeps explicit data and strategy directories; a Runtime treats it as read-only, so command-line overrides and account configuration from separate tasks cannot overwrite each other. Normal entries first use LoadRunSpec for the single policy list and field origins, then RunSpec.RuntimeSnapshot for common runtime settings. LoadRuntimeSnapshot retains time-series configuration assembly rather than replacing unified TS/CS routing.
+
 ## Important Structures
 
 ### CmdArgs
 Command line argument structure, containing the following fields:
 - `Configs`: []string - List of configuration file paths
+- `ConfigData`: string - YAML configuration content passed directly
 - `Logfile`: string - Log file path
 - `DataDir`: string - Data directory path
 - `NoCompress`: bool - Whether to disable compression
@@ -20,8 +25,16 @@ Command line argument structure, containing the following fields:
 - `Force`: bool - Whether to force execution
 - `WithSpider`: bool - Whether to use crawler
 - `MaxPoolSize`: int - Maximum connection pool size
-- `CPUProfile`: bool - Whether to enable CPU profiling
-- `MemProfile`: bool - Whether to enable memory profiling
+- `RawTables` / `Tables`: string / []string - Data table filters
+- `Medium`: string - K-line data medium: `db` or `file`
+- `InPath` / `InType`: string - Input path and input type
+- `OutPath` / `OutType`: string - Output path and output type
+- `AdjType`: string - K-line adjustment type: `pre`, `post`, or `none`
+- `ExgReal`: string - Actual exchange identifier
+- `Picker` / `PairPicker`: string - Optimization result and symbol selectors
+- `RunEveryTF`: string - Run at the specified timeframe
+- `BatchSize`: int - Task batch size
+- `DeadLock`: bool - Whether to enable deadlock detection
 - `TimeZone`: string - Time zone
 - `OptRounds`: int - Number of rounds for hyperparameter optimization single task
 - `Concur`: int - Number of concurrent processes for hyperparameter optimization
@@ -48,13 +61,18 @@ Root configuration structure, containing the following fields:
 - `PreFire`: float64 - Pre-firing
 - `MarginAddRate`: float64 - Margin addition rate
 - `ChargeOnBomb`: bool - Whether to charge on liquidation
-- `TakeOverStgy`: string - Takeover strategy
+- `TakeOverStrat`: string - Takeover strategy
 - `StakeAmount`: float64 - Single order amount
 - `StakePct`: float64 - Single order amount percentage
 - `MaxStakeAmt`: float64 - Maximum single order amount
 - `OpenVolRate`: float64 - Open position volume rate
 - `MinOpenRate`: float64 - Minimum open position rate
 - `BTNetCost`: float64 - Backtesting network delay (seconds)
+- `RelaySimUnFinish`: bool - Whether to relay unfinished orders from the start time
+- `NTPLangCode`: string - NTP time synchronization region code
+- `ShowLangCode`: string - UI display language code
+- `BTInLive`: *BtInLiveConfig - Scheduled live-trading backtest comparison configuration
+- `OrderBarMax`: int - Maximum number of bars to search backward for unfinished orders
 - `MaxOpenOrders`: int - Maximum number of open orders
 - `MaxSimulOpen`: int - Maximum number of simultaneous open orders
 - `WalletAmounts`: map[string]float64 - Wallet amounts
@@ -76,6 +94,8 @@ Root configuration structure, containing the following fields:
 - `APIServer`: *APIServerConfig - API server configuration
 - `RPCChannels`: map[string]map[string]interface{} - RPC channel configuration
 - `Webhook`: map[string]map[string]string - Webhook configuration
+- `Mail`: *MailConfig - SMTP email configuration
+- `LLMModels`: map[string]*llm.LLMModelConfig - LLM model configuration
 
 ### RunPolicyConfig
 Running policy configuration, allowing multiple strategies to run simultaneously, containing the following fields:
@@ -105,7 +125,10 @@ Database configuration, containing the following fields:
 - `Url`: string - Database connection URL
 - `Retention`: string - Data retention time
 - `MaxPoolSize`: int - Maximum connection pool size
-- `AutoCreate`: bool - Whether to automatically create the database
+- `AutoCreate`: bool - Whether to initialize or upgrade the banbot schema after connecting
+- `DbType`: string - Database type: `questdb` or `timescale`; inferred from the connection port when empty
+- `QdbMemPct`: float64 - QuestDB memory usage ratio, range 0 to 1; QuestDB only
+- `QdbMaxMemMB`: int - QuestDB maximum memory usage in MB; QuestDB only
 
 ### APIServerConfig
 API server configuration, containing the following fields:
@@ -121,18 +144,12 @@ API server configuration, containing the following fields:
 User configuration, containing the following fields:
 - `Username`: string - Username
 - `Password`: string - Password
+- `AllowIPs`: []string - List of allowed IP addresses
 - `AccRoles`: map[string]string - Account role permissions
 - `ExpireHours`: float64 - Token expiration time (hours)
 
-### WeWorkChannel
-WeWork channel configuration, containing the following fields:
-- `Enable`: bool - Whether to enable
-- `Type`: string - Type
-- `MsgTypes`: []string - Message types
-- `AgentId`: string - Application ID
-- `CorpId`: string - Enterprise ID
-- `CorpSecret`: string - Application secret
-- `Keywords`: string - Keywords
+### RPCChannels
+Notification channels are configured with `RPCChannels map[string]map[string]interface{}`. The keys are custom channel names, and the values provide channel-specific fields according to `type` (such as `mail`, `wework`, or `telegram`). See the examples in the [Configuration Guide](../guide/configuration.md).
 
 ### PairMgrConfig
 Pair manager configuration, containing the following fields:
@@ -140,6 +157,8 @@ Pair manager configuration, containing the following fields:
 - `Offset`: int - Offset
 - `Limit`: int - Limit
 - `ForceFilters`: bool - Whether to force filtering
+- `PosOnRotation`: string - Position handling during symbol rotation: `hold` or `close`
+- `UseLatest`: bool - Whether to use the latest date for the symbol list when cron is disabled in backtesting
 
 ### AccountConfig
 Account configuration, containing the following fields:
@@ -157,7 +176,7 @@ Account configuration, containing the following fields:
 Get data directory path.
 
 Returns:
-- `string` - Absolute path of the data directory. Returns empty string if environment variable `BanDataDir` is not set.
+- `string` - Absolute path of the data directory. A configuration error is raised when neither `BanDataDir` nor `-datadir` is provided; use `GetDataDirSafe` when an empty result is acceptable.
 
 ### GetStratDir
 Get strategy directory path.
@@ -166,13 +185,10 @@ Returns:
 - `string` - Absolute path of the strategy directory. Returns empty string if environment variable `BanStratDir` is not set.
 
 ### LoadConfig
-Load and apply configuration.
 
-Parameters:
-- `args`: *CmdArgs - Command line argument object
+Compatibility method: loads and applies package-level configuration; it is not an isolated multi-task entry. Normal entries use LoadRunSpec / RunSpec.RuntimeSnapshot. Snapshot.View is read-only, Snapshot.Clone owns copied containers, and execution accounts are copied separately with one shared lock.
 
-Returns:
-- `*errs.Error` - Error information, returns nil if successful
+Argument args *CmdArgs; returns *errs.Error.
 
 ### GetConfig
 Get configuration based on command line arguments.
@@ -196,7 +212,9 @@ Returns:
 - `*errs.Error` - Error information
 
 ### ApplyConfig
-Apply configuration to global state.
+Install configuration into the legacy package-level compatibility facade.
+
+Normal Runtime entry points do not use this function to carry task state; it remains for call chains that have not yet migrated.
 
 Parameters:
 - `args`: *CmdArgs - Command line argument object
@@ -204,12 +222,6 @@ Parameters:
 
 Returns:
 - `*errs.Error` - Error information
-
-### GetExgConfig
-Get current exchange configuration.
-
-Returns:
-- `*ExgItemConfig` - Exchange configuration object
 
 ### GetTakeOverTF
 Get takeover time frame for specified trading pair.
@@ -280,4 +292,17 @@ Parameters:
 
 Returns:
 - `*ExportConfig` - Export configuration object
-- `*errs.Error` - Error information 
+- `*errs.Error` - Error information
+
+## Factor-engine integration
+
+RunSpec retains one policy list and field origins; Snapshot is read-only and runtime accounts are copied separately. capital_weight is distinct from stake_rate.
+
+[Factor API](factor.md) / [Guide](../guide/factor.md)
+
+
+## Configuration ownership
+
+GetExgConfig is no longer an exported API; explicit sessions use Snapshot.View().Exchange. RPCChannels is a Config mapping (also retained as a compatibility variable), not a Runtime constructor. rpc.Session binds notifications to its snapshot/accounts. RunSpec.Config/Origins return owned copies; Snapshot.View is read-only by contract.
+
+LoadRunSpec/LoadUnifiedConfigs read YAML without automatically upgrading, backing up or rewriting it. config_version is optional; existing 1/2 markers remain accepted. Omitted engine retains legacy time-series More parameters; explicit engine enables new identity, account and budget fields. Factor fields live directly under run_policy[]; root accounts.&lt;name&gt; holds account execution overrides, while execution keeps shared defaults. Legacy nested input is readable; canonical output uses the shallow layout.

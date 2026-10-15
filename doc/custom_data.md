@@ -9,11 +9,13 @@
 - 旧版 Kline 策略接口还保留到什么边界
 - TimescaleDB / QuestDB / 回测链路当前如何验证
 
-本文只保留当前实现结论，不再保留历史讨论过程与旧版候选方案。
+本文按当前源码说明，不再把已完成的任意字段支持当作候选方案。演进证据：6639e39 注册与补齐，666dba0 字段聚合，55ad533 feeder/主链路统一 DataSeries，95633ff Spider 传 Rows，f8c32c7 复权保留字段，5a8c387 DataFields，82166d9 Bind/NewDataSub/job.Data，f6f0198 双引擎与事件/PIT输入。提交记录用于说明演进，API 以当前源码为准。
 
 ---
 
 ## 2. 快速接入入口
+
+第一次使用建议先读 [时序数据使用指南](series_usage.md)：从一份数据定义开始，完成写入、读取、订阅和跨源取值。本文继续保留底层架构和兼容性说明。
 
 banbot 推荐两种接入方式：
 
@@ -52,9 +54,9 @@ banbot 推荐两种接入方式：
 - 字段不属于 OHLCV 本体。
 - 希望回测和实盘启动时由 banbot 自动补齐、缓存，并通过 `OnData` / `DataHub` 进入策略。
 
-简单数据源示例见 `../banstrats/fundingrate/source.go`：定义 `orm.SeriesInfo`，再用 `data.RegisterFuncDataSource(...)` 注册 `FetchHistory`。
+简单数据源示例见 `../banstrats/fundingrate/source.go`：定义 `orm.SeriesInfo`，再用 `data.RegisterFuncDataSource(...)` 注册 `FetchHistory`；此入口会注册用于 Runtime 隔离的实例工厂。
 
-复杂数据源示例见 `../banstrats/longshort/source.go`：把分页、限流、解析校验和可选 live 订阅封装在 `Source` 中，再注册到同一个 `DataSource` 入口。
+复杂数据源示例见 `../banstrats/longshort/source.go`：把分页、限流、解析校验和可选 live 订阅封装在 `Source` 中，通过 `data.RegisterDataSourceFactory(name, factory)` 注册独立实例工厂。只用包级 RegisterDataSource 注册共享实例而没有工厂，会被显式 Runtime catalog 拒绝。
 
 #### 2.2.1 手动写入和读取
 
@@ -62,13 +64,30 @@ banbot 推荐两种接入方式：
 
 #### 2.2.2 策略中订阅
 
-策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中读取 `orm.DataSeries`，需要最新缓存时走 `job.DataHub.Latest(...)`。
+策略订阅示例见 `../banstrats/fundingrate/strategy.go`：在 `OnDataSubs` 返回 `strat.DataSub`，在 `OnData` 中接收嵌入了 `strat.DataFields` 的 `strat.DataEvent`，跨数据源读取使用 `job.DataHub.Get(...)`。
 
 回测和实盘启动时，banbot 会从 `OnDataSubs` 收集订阅，按 `(source, sid, timeframe)` 去重，取最大的 `WarmupNum` 并合并 `Fields` 字段并集，再调用已注册的 `DataSource.FetchHistory` 补齐缺口。
 
-`Fields` 为空时，kline 使用 `open, high, low, close, volume, quote, buy_volume, trade_num`，独立数据源使用其 `SeriesInfo.Binding.Fields`。多个策略订阅同一数据流的不同字段时，数据源只收到一个合并后的订阅，所有订阅策略的 `OnData` 都收到该字段并集。
+`Fields` 控制数据源读取投影；为空时，kline 使用 `open, high, low, close, volume, quote, buy_volume, trade_num`，独立数据源使用其 `SeriesInfo.Binding.Fields`。`SeriesFields` 控制哪些字段维护为 `banta.Series`；未配置时默认选择 schema 中的 `float*` 字段，运行时无 schema 的数据按 `float32/float64` 值识别。显式 `SeriesFields` 会自动并入 `Fields`。
 
-读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", Fields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可读取 `evt.Values["open_interest"]`，`OnBar` 继续正常消费 OHLCV。
+读取 kline 扩展列时仍使用同一个订阅入口，例如 `DataSub{Source: "kline", SeriesFields: []string{"open_interest"}, ...}`。主 kline 的默认字段会和显式字段合并，因此 `OnData` 可通过 `data.Series("open_interest")` 或 `data.Float64("open_interest")` 读取；未实现 `OnData` 的旧策略仍可通过 `OnBar` 消费 OHLCV。
+
+### 2.3 WebUI / DashboardUI 管理与查看
+
+已注册的任意独立时序数据都可以在两个 UI 中查看：
+
+- 开发端：`数据`页面的 `Series Ranges` 和 `Data Sources` 表都提供 `View` 入口。
+- Dashboard：侧栏 `数据`入口提供相同的序列查看器，读取当前连接的 bot API。
+- 查看器按 `source + sid + timeframe` 查询，可限定起止时间、最大行数和字段子集；未填写时间时默认读取最近 30 天，最大单次返回 1000 行。
+- 返回值保留 `DataSeries` 的时间区间、闭合状态和 `Values`，所以 `float`、`int`、`string`、`bool`、`json` 字段均可直接检查。字段筛选只接受注册 `SeriesInfo.Binding.Fields` 中定义的列。
+
+底层接口为只读 `GET /api/kline/series`：
+
+```text
+source=<source>&sid=<sid>&timeframe=<tf>&start=<ms>&end=<ms>&limit=<n>&fields=a,b
+```
+
+其中 `source` 为已注册数据源名，`sid` 为 `ExSymbol.ID`。内置 `kline` 也可通过该接口读取默认 OHLCV 字段，或在 `fields` 中声明数值型扩展列。写入、补齐与删除仍应通过 `SeriesStore` / 数据源运行时完成；查看器不执行任何修改。
 
 ---
 
@@ -81,7 +100,7 @@ banbot 内部主链路已经统一改为 `orm.DataSeries`：
 - `data.Feeder` / `data.Provider` 回调统一为 `FnDataSeries`
 - `biz.Trader` 主入口为 `FeedDataSeries` / `FeedSeries`
 - `live.CryptoTrader`、`opt.BackTestLite`、`opt.BackTest` 统一消费 `DataSeries`
-- `strat.DataHub` 统一缓存 `DataSeries`
+- `strat.DataHub` 将 `DataSeries` 处理为按订阅隔离的 `DataFields`
 
 ### 3.2 统一仓储名称：`SeriesRepo`
 
@@ -138,7 +157,7 @@ _ = store.Delete(ctx, info, target, startMS, endMS)
 - `Sid=0` 行自动补成目标 `ExSymbol.ID`
 - 写入后通过 `SeriesRepo.UpdateSeriesCoverage(...)` 更新覆盖范围
 
-### 3.3 `ExSymbol` / source 身份只由 `exchange + market + symbol` 确定
+### 3.3 `ExSymbol` 身份由 `exchange + market + symbol` 确定
 
 当前实现中，`ExSymbol` 的 sid 解析、缓存 key、查询接口均以三元组为准：
 
@@ -150,7 +169,7 @@ _ = store.Delete(ctx, info, target, startMS, endMS)
 
 因此当前规则是：
 
-> 一个 source / ExSymbol 由 `exchange + market + symbol` 唯一确定；`exg_real` 只是附带元数据，不再是身份维度。
+> 一个 ExSymbol 由 `exchange + market + symbol` 唯一确定，source 则由 catalog 中的名称区分；`exg_real` 只是附带元数据，不再是身份维度。
 
 自定义/抽象标的通过 `orm.EnsureExSymbol(exchange, market, symbol, exgReal...)` 创建或复用：
 
@@ -286,7 +305,8 @@ type DataRecord struct {
 
 - `Sid` 是最终存储主键的一部分
 - `TimeMS` / `EndMS` 表示该记录覆盖区间
-- `Values` 按 `SeriesBinding.Fields` 写入固定列
+- `Values map[string]any` 按 `SeriesBinding.Fields` 写入固定列；运行时保留具体类型、NULL 和缺键
+- 数据库规范化 float/int，并编码 JSON；未声明字段不会自动建列，固定列往返不能恢复写入前的缺键状态或所有 Go 类型
 
 `EnsureSeriesRange(...)` 会自动把 `Sid=0` 的记录补成目标 `sub.ExSymbol.ID`，但最终入库前 sid 必须确定。
 
@@ -346,10 +366,11 @@ type DataSource interface {
 }
 ```
 
-注册入口：
+进程定义注册入口（复杂源应提供工厂，运行时使用所属 catalog）：
 
 ```go
 func RegisterDataSource(src DataSource) error
+func RegisterDataSourceFactory(name string, factory DataSourceFactory) error
 ```
 
 注册时会校验：
@@ -365,7 +386,11 @@ type DataSub struct {
     Source    string
     ExSymbol  *orm.ExSymbol
     TimeFrame string
-    WarmupNum int
+    WarmupNum    int
+    Fields       []string
+    SeriesFields []string
+    Frequency    orm.FrequencyKind
+    Projection   orm.FieldProjection
 }
 ```
 
@@ -374,7 +399,9 @@ type DataSub struct {
 - `Source`：数据源名；空值会归一化为 `kline`
 - `ExSymbol`：所有订阅最终都必须挂到一个 sid 上
 - `TimeFrame`：订阅周期
-- `WarmupNum`：回测 / 实盘初始化预热量
+- `WarmupNum`：规则周期为预热条数；event 流为观测条数，source 需实现 ObservationWarmupSource 解析真实起点
+- `Frequency`：bar/event；event 使用 TimeFrame="event"，合法声明仍需要 reader 支持
+- `Projection`：default/all/selected，Fields 读取原始字段、SeriesFields 维护派生数值视图
 
 ### 5.3 历史补齐：`EnsureSeriesRange`
 
@@ -390,6 +417,18 @@ type DataSub struct {
 
 `data.EnsureRuntimeSeriesRange(...)` / `data.EnsureSeriesSubsRange(...)` 是当前中性的运行时补齐入口；旧的
 `EnsureThirdPartySeriesRange(...)` / `EnsureThirdPartySeriesSubsRange(...)` 仍保留为兼容 alias。
+
+也可以在回测或参数优化前显式补齐已注册的数据源：
+
+```bash
+./bot series list
+./bot series down -pairs BTC/USDT,ETH/USDT -tables funding_rate \
+  -timestart 2025-01-01 -timeend 2026-01-01
+```
+
+`series list` 输出包含 source 名称、周期、物理表和字段定义的 JSON。`series down` 中的 `-tables`
+按 source 名称筛选；不传时补齐全部已注册 source。下载结束时间会按各 source 的周期截断到最后一个
+已闭合区间，QuestDB 下还会等待 `sranges_q` 覆盖范围可见后再退出。
 
 ### 5.4 `sranges` 仍然复用 `(sid, table, timeframe)`
 
@@ -431,7 +470,7 @@ type DataSub struct {
 说明：
 
 - TimescaleDB 中 `json` 会落 `JSONB`
-- QuestDB 中 `json` 第一阶段按字符串保存
+- QuestDB 中 `json` 按字符串保存
 - QuestDB 建表使用 `timestamp(...) ... WAL DEDUP UPSERT KEYS(sid, time)`；分区粒度按 timeframe 选择（如 `1m` 用 `WEEK`，`1h` / `1d` 用 `YEAR`，其他默认 `MONTH`）
 - PostgreSQL/TimescaleDB 使用 `(sid, time)` 主键 upsert
 
@@ -473,14 +512,16 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 
 `biz.Trader.FeedDataSeries(...)` 当前逻辑：
 
-1. 先尝试 `AsKline(evt)`
-2. 若不能转成 bar，则走 `feedDataOnlySeries(...)`
-3. 若能转成 bar，则走 `feedClosedSeries(...)`
+1. 按所属 Runtime 的 SymbolState 解析并验证标的
+2. 非 kline source，或不具备 OHLCV 的事件走 `feedDataOnlySeries(...)`
+3. 只有 source=kline 且具备 OHLCV 的事件走 `feedClosedSeries(...)`
+
+不能仅根据字段恰好包含 open/high/low/close 就把自定义 source 当成交易 K 线。
 
 因此：
 
 - **纯通用数据**：进入 `OnData` + `DataHub`
-- **bar 形态数据**：既可进入 `OnData`，也可继续兼容旧 `OnBar` / `OnInfoBar`
+- **内置 kline 且有 OHLCV**：进入主/辅助 K 线角色，按配置消费 OnData 或兼容 OnBar / OnInfoBar；自定义源即使有 OHLCV 形态仍走 Custom
 
 ### 6.3 新旧策略回调优先级
 
@@ -488,13 +529,13 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 
 #### 闭合主序列 / 闭合 side-input
 
-- 若策略实现了 `OnData`，优先调用 `OnData`
-- 否则若该事件可 `AsKline`，再回落到 `OnBar` / `OnInfoBar`
+- OnData 不能与 OnBar/OnInfoBar 同时配置，策略构建时拒绝冲突
+- 未配置 OnData 的兼容策略，仅在内置 kline 角色消费 OnBar/OnInfoBar；自定义订阅应配置 OnData
 
 #### websocket 数据
 
 - 若策略实现了 `OnWsData`，优先调用 `OnWsData`
-- 否则仍可回落到 `OnWsKline` / `OnWsTrades` / `OnWsDepth`
+- WebSocket K 线可回落到 OnWsKline；逐笔与盘口仍分别使用 OnWsTrades/OnWsDepth，不是 OnWsData 的通用回退
 
 也就是说：
 
@@ -502,17 +543,37 @@ QuestDB 自定义时序删除不是“永远逻辑删除”，也不是每次删
 
 ### 6.4 `DataHub` 作为统一运行时缓存
 
-`StratJob.DataHub` 统一缓存按 `(source, sid, timeframe)` 索引的运行时数据：
+`StratJob.DataHub` 统一缓存按 `(timeframe, source, sid)` 索引的处理后字段：
 
 ```go
-type DataHub interface {
-    Set(evt *orm.DataSeries)
-    Latest(source string, sid int32, tf string) *orm.DataSeries
-    Window(source string, sid int32, tf string, n int) []*orm.DataSeries
+type DataHub struct {
+    // 内部按 timeframe -> source -> sid 保存 *DataFields
 }
+
+func (d *DataHub) Get(tf, source string, sid int32) *DataFields
+func (d *DataHub) AllReady() bool
+
+type DataFields struct {
+    DoneMS    int64
+    TimeMS    int64
+    Source    string
+    Sid       int32
+    TimeFrame string
+    Closed    bool
+    IsWarmUp  bool
+}
+
+func (d *DataFields) Series(name string) *banta.Series
+func (d *DataFields) Float64(name string) float64
+func (d *DataFields) Int64(name string) int64
+func (d *DataFields) Raw(name string) any
+func (d *DataFields) RawValue(name string) (any, bool)
+func (d *DataFields) Has(name string) bool
 ```
 
-这使策略可以直接读取 side-input，而不再依赖 `pair_tf` 这种只适用于 kline 的单一视角。
+`RawValue` 的存在标记保留显式 nil 与缺键，数值历史是派生视图，NULL/缺失点为 NaN。job.Data(sub) 从本 job 的 DataHub 取视图，不查询数据库。
+
+`AllReady()` 使用当前 Hub 已处理事件的最大 `EndMS` 作为事件时间，只检查在该时间点应当闭合的周期。例如 16:05 会要求 1m 和 5m 的全部订阅 `DoneMS >= 16:05`，不会要求尚未闭合的 15m。订阅会在首个事件前预注册，因此尚未收到过的数据源不会被误判为已就绪。AllReady 是周期闭合检查，不能作为 event/稀疏数据的新鲜度或严格 PIT 屏障。
 
 ---
 
@@ -531,28 +592,54 @@ type DataHub interface {
 
 ```go
 func init() {
-    strat.AddStrat(&strat.TradeStrat{
-        Name: "macro_demo",
-        OnDataSubs: func(job *strat.StratJob) []*strat.DataSub {
-            return []*strat.DataSub{
-                {
-                    Source:    "macro_cpi",
-                    ExSymbol:  job.Symbol,
-                    TimeFrame: "1d",
-                    WarmupNum: 30,
-                    Fields:    []string{"value", "revision"},
-                },
-            }
-        },
-        OnData: func(job *strat.StratJob, evt *orm.DataSeries) {
-            if evt.Source != "macro_cpi" {
-                return
-            }
-            latest := job.DataHub.Latest("macro_cpi", evt.Sid, evt.TimeFrame)
-            _ = latest
-        },
-    })
+	strat.RegisterStrategy("macro_demo", func(_ *config.RunPolicyConfig) *strat.TradeStrat {
+		return &strat.TradeStrat{
+			Name: "macro_demo",
+			OnDataSubs: func(job *strat.StratJob) []*strat.DataSub {
+				return []*strat.DataSub{
+					{
+						Source:       "macro_cpi",
+						ExSymbol:     job.Symbol,
+						TimeFrame:    "1d",
+						WarmupNum:    30,
+						Fields:       []string{"value", "revision"},
+						SeriesFields: []string{"value"},
+					},
+				}
+			},
+			OnData: strat.RouteData(strat.DataHandlers{
+				Custom: func(job *strat.StratJob, data strat.DataEvent) {
+					if data.Source != "macro_cpi" {
+						return
+					}
+					value := data.Series("value")
+					revision := data.Int64("revision")
+					if !job.DataHub.AllReady() {
+						return
+					}
+					latest := job.DataHub.Get("1d", "macro_cpi", data.Sid)
+					_, _, _ = value, revision, latest
+				},
+			}),
+		}
+	})
 }
+```
+
+`DataEvent` 嵌入了 `*DataFields`，因此字段读取方式不变；同时提供 `Role`、`Symbol`、`IsMain()` 和 `IsKline()`。没有辅助或自定义订阅的策略可直接赋值 `OnData`，无需包装。需要过滤或分别处理主周期、辅助 K 线和自定义数据时，使用：
+
+```go
+OnData: strat.RouteData(strat.DataHandlers{
+    Main: func(job *strat.StratJob, data strat.DataEvent) {
+        // 原 OnBar 逻辑
+    },
+    Info: func(job *strat.StratJob, data strat.DataEvent) {
+        // 原 OnInfoBar 逻辑
+    },
+    Custom: func(job *strat.StratJob, data strat.DataEvent) {
+        // 自定义时序逻辑
+    },
+})
 ```
 
 ### 7.2 旧策略兼容边界
@@ -568,7 +655,8 @@ func init() {
 
 - `OnPairInfos` 会在内部桥接为 `DataSub{Source: "kline", ...}`
 - `OnInfoBar` 仅在 side-input 能适配成 kline 且策略未实现 `OnData` 时触发
-- 主 kline 事件会分别尝试触发 `OnData` 和 `OnBar`：`OnData` 获得完整 `DataSeries.Values`，`OnBar` 使用可识别的 OHLCV 字段
+- `OnBar` 仅在主 kline 事件且策略未实现 `OnData` 时触发；同一事件不会同时调用两个回调
+- `OnData` 不能与 `OnBar` 或 `OnInfoBar` 同时配置；策略构建会直接报错，请把旧回调逻辑迁移到 `RouteData` 的 `Main` / `Info` 处理器
 
 ### 7.3 新代码不要再把 Kline 当作通用自定义数据契约
 
@@ -589,7 +677,7 @@ func init() {
 `BackTestLite` / `BackTest` 已统一改为消费 `DataSeries`：
 
 - `FeedDataSeries(evt *orm.DataSeries)` 成为回测主入口
-- 对可 `AsKline` 的事件，继续执行原有撮合、账户、报表逻辑
+- 仅内置 source=kline 且具备 OHLCV 的事件进入 K 线撮合、账户和报表逻辑；自定义 OHLCV 形态不会改变角色
 - 对纯通用数据，直接进入 `Trader` 的 `OnData` 分发链路
 - 独立时序表通过通用历史 feeder 读取，并和 kline feeder 一起按事件结束时间排序回放
 
@@ -598,7 +686,7 @@ func init() {
 `CryptoTrader` 已统一改为消费 `DataSeries`：
 
 - 闭合 kline 仍通过内置 OHLCV 适配器进入 `FeedDataSeries`
-- 有 kline 扩展字段订阅时，闭合行会按字段并集从数据库回读并合并到 `DataSeries.Values`
+- 有 kline 扩展字段订阅时，缺字段的闭合行按并集回读并合并到 DataSeries.Values；已有键（包括显式 NULL）不覆盖
 - websocket 闭合/未闭合事件优先走 `OnWsData`
 - 旧 `OnWsKline` 仅作为兼容回退
 
@@ -633,16 +721,22 @@ func init() {
 - `TestEnsureSeriesRangeQuestDB`
 - `TestHistSeriesFeederJoinsUnifiedTimeline`
 
+#### `web/base`
+
+- `TestResolveSeriesQueryInfoProjectsRegisteredFields`
+- `TestResolveSeriesQueryInfoBuildsKlineMetadata`
+
 #### `biz`
 
-- `TestOHLCVSeriesTriggersOnDataAndOnBar`
+- `TestOHLCVSeriesUsesOnDataWithMainRole`
 - `TestNonKlineOHLCVShapeTriggersOnlyOnData`
 - `TestFeedSeriesRoutesNonKlineDataSubs`
 - `TestFeedSeriesFallsBackToOnInfoBarForLegacyKlineSubs`
 
 #### `strat`
 
-- `TestDataHubLatestAndWindow`
+- `TestDataHubBuildsConfiguredAndDefaultSeries`
+- `TestDataHubAllReadyOnlyChecksClosingTimeframes`
 - `TestCollectDataSubsBridgesLegacyPairInfos`
 - `TestUpdatePairs_RebuildsWarmsFromCurrentDataSubs`
 
@@ -679,5 +773,15 @@ func init() {
 4. **`exg_real` 仅保留为元信息，不参与 sid 身份判定。**
 5. **`SeriesBinding.SIDColumn` 可为空，默认 `sid`。**
 6. **内部通用数据链路一律使用 `DataSeries` / `DataRecord` / `SeriesInfo` / `SeriesBinding`。**
-7. **旧 Kline 接口只保留在 `TradeStrat` / `StratJob` 的兼容层，不再作为新功能设计基准。**
+7. **新功能使用通用 DataSeries；旧 Kline 策略接口和默认 OHLCV 查询只用于兼容视图。**
+8. **Spider/BanIO 的 JSON payload 需要类型恢复校验，不能宣称 map 的 Go 类型自动无损往返。**
+9. **QuestDB 写后读等待目标可见，替换前验证快照，超时保留恢复标记。**
 8. **所有新接入的第三方时序数据都应先注册 source，再通过 `DataSub + ExSymbol.sid` 接入统一主链路。**
+9. **管理端和 Dashboard 的明细查看统一使用 `/api/kline/series`；该接口只读，不替代数据源的写入与补齐流程。**
+10. **性能优化不得回退 v0.4.3 的任意时序数据和 K 线自定义列能力；`DataSeries.Values` 是必须保留的通用兼容边界。**
+
+## 2026-10-04 双引擎使用入口
+
+run_policy.engine 接受 time_series/factor，省略时为时序。原生多因子图、表达式、PIT、成熟标签、weights/events、混合账户和实时生命周期见[多因子与截面指南](../bandoc/zh-CN/guide/factor.md)及[API](../bandoc/zh-CN/api/factor.md)。逐包结论和本次验证见[重构记录](strategy_engine_refactor.md)。
+
+execution.live_provider: verified-session 只是用户工厂示例名，必须先注册 entry.RegisterFactorLiveBinding("verified-session", factory) 并提供真实证据。内置 empty/banexg 或未注册工厂缺能力时明确失败，不自动降级 paper；trade --dry-run 是历史模拟。最新值数据库必须显式 static-approximation；任意字段/NULL 继续通过 DataSeries.Values。

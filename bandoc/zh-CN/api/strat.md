@@ -11,20 +11,25 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `Name string` - 策略名称
 - `Version int` - 策略版本号
 - `WarmupNum int` - 预热所需的K线数量
-- `MinTfScore float64` - 最小时间周期质量，默认0.75
+- `MinTfScore float64` - 最小时间周期质量，默认0.8
 - `WsSubs map[string]string` - websocket订阅: core.WsSubKLine, core.WsSubTrade, core.WsSubDepth
 - `DrawDownExit bool` - 是否启用回撤退出
 - `HedgeOff bool` -关闭合约双向持仓
-- `BatchInOut bool` - 是否批量执行入场/出场
-- `BatchInfo bool` - 是否对OnInfoBar后执行批量处理
+- `BatchInOut bool` - 是否在主周期 `OnData(RoleMain)`/`OnBar` 后批量执行入场/出场
+- `BatchInfo bool` - 是否在辅助周期 `OnData(RoleInfo)`/`OnInfoBar` 后执行批量处理
 - `StakeRate float64` - 相对基础金额开单倍率
 - `StopLoss float64` - 此策略打开所有订单的默认止损比率（不带杠杆）
 - `StopEnterBars int` - 限价入场单超时K线数
 - `EachMaxLong int` - 每个交易对最大做多订单数，-1表示禁用
 - `EachMaxShort int` - 每个交易对最大做空订单数，-1表示禁用
-- `AllowTFs []string` - 允许运行的时间周期，不提供时使用全局配置
+- `RunTimeFrames []string` - 允许运行的时间周期；未提供时使用当前 Runtime 配置快照中的默认周期
 - `Outputs []string` - 策略输出的文本文件内容，每个字符串是一行
 - `Policy *config.RunPolicyConfig` - 策略运行配置
+- `OnDataSubs`: 声明 K 线扩展列或自定义时序数据订阅
+- `OnData`: 接收统一的 `strat.DataEvent`；事件嵌入已更新 Series/最新值的 `*strat.DataFields`，并标识主周期、辅助 K 线或自定义时序
+- `OnWsData`: 接收 websocket 时序事件
+
+没有辅助或自定义订阅时直接赋值 `OnData`。需要过滤时使用 `RouteData(DataHandlers{...})` 分别处理三类事件。`OnData` 不能与 `OnBar` 或 `OnInfoBar` 同时配置。
 
 ### StratJob
 策略任务实例，负责执行具体的交易操作。
@@ -55,6 +60,22 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `ShortTPPrice float64` - 开仓时默认做空止盈价格
 - `IsWarmUp bool` - 当前是否处于预热状态
 - `More interface{}` - 策略自定义的额外信息
+- `DataHub`: 按 `(source, sid, timeframe)` 缓存最新事件和窗口数据
+
+### DataSub
+时序数据订阅信息。
+
+公开字段：
+- `Source string` - 数据源名称；空值等同 `kline`
+- `ExSymbol *orm.ExSymbol` - 绑定标的
+- `TimeFrame string` - 数据源基础周期
+- `WarmupNum int` - 初始化预热数量
+- `Fields []string` - 需要读取的字段
+
+### DataHub
+运行时数据缓存。`Get(tf, source, sid)` 返回处理后的 `DataFields`，`AllReady()` 判断当前事件时间上应闭合的全部订阅是否已经更新。自定义数据的订阅和消费示例请参阅[自定义时序数据](../guide/custom_data.md)。
+
+`OnBatchJobs` 仅接收主周期任务，并由 `BatchInOut` 开启；辅助周期任务进入 `OnBatchInfos`，由 `BatchInfo` 开启。
 
 ### JobEnv
 在OnBatchInfos中表示某个额外品种数据的job
@@ -64,8 +85,11 @@ strat 包提供了交易策略相关的功能定义和实现。
 - `Env *ta.BarEnv` - 指标运行环境
 - `Symbol string` - 交易对名称
 
-### BatchMap
-当前交易所-市场-时间周期下，所有标的的批量执行任务池。
+### BatchState / BatchMap
+
+`BatchState` 持有单个 trader 的批量队列和回测批次时间。使用 `NewBatchState` 创建实例，`AddTask` 入队、`TakeReady(currMS, deterministic)` 取出到期批次、`PendingCount` 查询、`Reset` 清空。严格回测开启确定性排序；普通模式不承诺顺序。`LegacyBatchState` 仅服务包级兼容调用。
+
+`BatchMap` 是队列内部的一个时间周期任务组，不是进程共享的市场状态。
 
 公开字段：
 - `Map map[string]*JobEnv` - 任务映射
@@ -244,3 +268,9 @@ strat 包提供了交易策略相关的功能定义和实现。
 
 ### ExitStratJobs
 退出所有策略任务。
+
+## 因子引擎集成
+
+TradeStrat 是时序域，图和组合在 factor/runner；DataHub rawMap 的 NULL/缺失语义与数值视图并存。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)

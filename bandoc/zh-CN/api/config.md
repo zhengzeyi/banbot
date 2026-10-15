@@ -2,11 +2,16 @@
 
 config 包提供了系统配置相关的结构体和方法。
 
+## 运行时配置
+
+常规入口会先解析配置，再创建一份属于任务的 `config.Snapshot`。Snapshot 深拷贝配置并保存显式的数据/策略目录；Runtime 将其视为只读配置，因此不同任务的命令行覆盖和账户配置不会彼此改写。普通入口先使用 LoadRunSpec 解析唯一 policy 列表和字段来源，再由 RunSpec.RuntimeSnapshot 取得运行配置；单独 LoadRuntimeSnapshot 保留时序配置装配，不替代完整 TS/CS 路由。
+
 ## 重要结构体
 
 ### CmdArgs
 命令行参数结构体,包含以下字段:
 - `Configs`: []string - 配置文件路径列表
+- `ConfigData`: string - 直接传入的 YAML 配置内容
 - `Logfile`: string - 日志文件路径
 - `DataDir`: string - 数据目录路径
 - `NoCompress`: bool - 是否不压缩
@@ -20,8 +25,16 @@ config 包提供了系统配置相关的结构体和方法。
 - `Force`: bool - 是否强制执行
 - `WithSpider`: bool - 是否使用爬虫
 - `MaxPoolSize`: int - 最大连接池大小
-- `CPUProfile`: bool - 是否开启CPU性能分析
-- `MemProfile`: bool - 是否开启内存性能分析
+- `RawTables` / `Tables`: string / []string - 数据表筛选条件
+- `Medium`: string - K 线数据介质：`db` 或 `file`
+- `InPath` / `InType`: string - 输入路径和输入类型
+- `OutPath` / `OutType`: string - 输出路径和输出类型
+- `AdjType`: string - K 线复权类型：`pre`、`post` 或 `none`
+- `ExgReal`: string - 实际交易所标识
+- `Picker` / `PairPicker`: string - 优化结果和品种选择器
+- `RunEveryTF`: string - 按指定周期运行
+- `BatchSize`: int - 任务批量大小
+- `DeadLock`: bool - 是否启用死锁检测
 - `TimeZone`: string - 时区
 - `OptRounds`: int - 超参数优化单任务执行轮次
 - `Concur`: int - 超参数优化多进程并发数量
@@ -48,13 +61,18 @@ config 包提供了系统配置相关的结构体和方法。
 - `PreFire`: float64 - 预发射
 - `MarginAddRate`: float64 - 追加保证金比率
 - `ChargeOnBomb`: bool - 是否在爆仓时收费
-- `TakeOverStgy`: string - 接管策略
+- `TakeOverStrat`: string - 接管策略
 - `StakeAmount`: float64 - 单笔开单金额
 - `StakePct`: float64 - 单笔开单金额百分比
 - `MaxStakeAmt`: float64 - 单笔最大开单金额
 - `OpenVolRate`: float64 - 开单数量倍率
 - `MinOpenRate`: float64 - 最小开单比率
 - `BTNetCost`: float64 - 回测网络延迟(秒)
+- `RelaySimUnFinish`: bool - 是否接力开始时间的未完成订单
+- `NTPLangCode`: string - NTP 时间同步区域代码
+- `ShowLangCode`: string - 界面显示语言代码
+- `BTInLive`: *BtInLiveConfig - 实盘定时回测对比配置
+- `OrderBarMax`: int - 查找未完成订单的最大回溯 bar 数
 - `MaxOpenOrders`: int - 最大开单数量
 - `MaxSimulOpen`: int - 最大同时开单数量
 - `WalletAmounts`: map[string]float64 - 钱包金额
@@ -76,6 +94,8 @@ config 包提供了系统配置相关的结构体和方法。
 - `APIServer`: *APIServerConfig - API服务器配置
 - `RPCChannels`: map[string]map[string]interface{} - RPC通道配置
 - `Webhook`: map[string]map[string]string - Webhook配置
+- `Mail`: *MailConfig - SMTP 邮件配置
+- `LLMModels`: map[string]*llm.LLMModelConfig - LLM 模型配置
 
 ### RunPolicyConfig
 运行策略配置,可以同时运行多个策略,包含以下字段:
@@ -105,7 +125,10 @@ config 包提供了系统配置相关的结构体和方法。
 - `Url`: string - 数据库连接URL
 - `Retention`: string - 数据保留时间
 - `MaxPoolSize`: int - 最大连接池大小
-- `AutoCreate`: bool - 是否自动创建数据库
+- `AutoCreate`: bool - 连接成功后是否初始化或升级 banbot schema
+- `DbType`: string - 数据库类型：`questdb` 或 `timescale`；留空时按连接端口自动识别
+- `QdbMemPct`: float64 - QuestDB 内存使用比例，范围 0~1，仅 QuestDB 生效
+- `QdbMaxMemMB`: int - QuestDB 最大内存使用量（MB），仅 QuestDB 生效
 
 ### APIServerConfig
 API服务器配置,包含以下字段:
@@ -121,18 +144,12 @@ API服务器配置,包含以下字段:
 用户配置,包含以下字段:
 - `Username`: string - 用户名
 - `Password`: string - 密码
+- `AllowIPs`: []string - 允许访问的 IP 列表
 - `AccRoles`: map[string]string - 账户角色权限
 - `ExpireHours`: float64 - Token过期时间(小时)
 
-### WeWorkChannel
-企业微信通道配置,包含以下字段:
-- `Enable`: bool - 是否启用
-- `Type`: string - 类型
-- `MsgTypes`: []string - 消息类型
-- `AgentId`: string - 应用ID
-- `CorpId`: string - 企业ID
-- `CorpSecret`: string - 应用密钥
-- `Keywords`: string - 关键词
+### RPCChannels
+通知渠道由 `RPCChannels map[string]map[string]interface{}` 配置。键是自定义渠道名称，值按 `type`（如 `mail`、`wework`、`telegram`）提供该渠道所需的字段；请参阅[配置指南](../guide/configuration.md)中的示例。
 
 ### PairMgrConfig
 交易对管理配置,包含以下字段:
@@ -140,6 +157,8 @@ API服务器配置,包含以下字段:
 - `Offset`: int - 偏移量
 - `Limit`: int - 限制数量
 - `ForceFilters`: bool - 是否强制过滤
+- `PosOnRotation`: string - 品种轮换时处理仓位：`hold` 或 `close`
+- `UseLatest`: bool - 回测未启用 cron 时是否按最新日期确定品种列表
 
 ### AccountConfig
 账户配置,包含以下字段:
@@ -157,7 +176,7 @@ API服务器配置,包含以下字段:
 获取数据目录路径。
 
 返回：
-- `string` - 数据目录的绝对路径。如果环境变量 `BanDataDir` 未设置,返回空字符串。
+- `string` - 数据目录的绝对路径。未提供 `BanDataDir` 或 `-datadir` 时会触发配置错误；需要可空结果时使用 `GetDataDirSafe`。
 
 ### GetStratDir 
 获取策略目录路径。
@@ -166,13 +185,10 @@ API服务器配置,包含以下字段:
 - `string` - 策略目录的绝对路径。如果环境变量 `BanStratDir` 未设置,返回空字符串。
 
 ### LoadConfig
-加载并应用配置。
 
-参数：
-- `args`: *CmdArgs - 命令行参数对象
+兼容方法：加载后应用包级配置，不能用于新多任务运行器的状态隔离。普通入口使用 LoadRunSpec / RunSpec.RuntimeSnapshot；Snapshot.View 只读，Snapshot.Clone 取得独立容器副本，执行账户另行复制并使用同一锁。
 
-返回：
-- `*errs.Error` - 错误信息,如果成功则返回 nil
+参数 args *CmdArgs；返回 *errs.Error。
 
 ### GetConfig
 根据命令行参数获取配置。
@@ -196,7 +212,9 @@ API服务器配置,包含以下字段:
 - `*errs.Error` - 错误信息
 
 ### ApplyConfig
-应用配置到全局状态。
+将配置安装到旧的包级兼容 facade。
+
+常规的 Runtime 入口不依赖此函数来传递任务状态；它保留给尚未迁移的旧调用链。
 
 参数：
 - `args`: *CmdArgs - 命令行参数对象
@@ -204,12 +222,6 @@ API服务器配置,包含以下字段:
 
 返回：
 - `*errs.Error` - 错误信息
-
-### GetExgConfig
-获取当前交易所配置。
-
-返回：
-- `*ExgItemConfig` - 交易所配置对象
 
 ### GetTakeOverTF
 获取指定交易对的接管时间周期。
@@ -281,3 +293,16 @@ API服务器配置,包含以下字段:
 返回：
 - `*ExportConfig` - 导出配置对象
 - `*errs.Error` - 错误信息
+
+## 因子引擎集成
+
+RunSpec 保存唯一 policy 列表和字段来源；Snapshot 只读，执行账户另复制；capital_weight 不等于 stake_rate。
+
+[因子 API](factor.md) / [指南](../guide/factor.md)
+
+
+## 配置读取归属
+
+GetExgConfig 已不是当前导出 API；显式会话使用 Snapshot.View().Exchange。RPCChannels 是 Config 的配置映射（同时有旧 facade 变量），不是构造 Runtime 的方法；通知运行时由 rpc.Session 使用其 Snapshot 和账户配置。RunSpec.Config/Origins 返回所有权副本，Snapshot.View 按约定只读。
+
+统一入口 LoadRunSpec/LoadUnifiedConfigs 只读 YAML，不自动升级、备份或写回，config_version 不必填写；已有 1/2 标记仍接受。省略 engine 保留旧时序 More 参数语义，显式 engine 才启用新增身份、账户与预算字段。因子字段直接位于 run_policy[]；账户执行覆盖位于根 accounts.&lt;name&gt;，公共 execution 默认值仍保留。旧嵌套输入可解析，规范输出只使用浅层布局。

@@ -9,7 +9,7 @@
 :::
 
 ## Go包介绍&依赖关系
-banbot按功能特性和依赖关系划分了若干不同的包，而常用的一些全局变量大多分散在多个包，下面是全部包的依赖关系：
+banbot 按功能特性和依赖关系划分为多个包。任务执行时，`entry` 会为每次回测、实盘或优化创建显式的 `runtime.Runtime`；配置、时钟、市场与交易对、策略、订单、钱包和数据依赖随该 Runtime 一起传递，而不是以包级可变状态作为任务之间的通信方式。下面是各包的依赖关系：
 #### [core](core.md)
 被所有其他包引用的一些类型、方法、常量和变量；如超参数定义、价格、简单Ema、错误代码等。
 #### [btime](btime.md)
@@ -30,18 +30,19 @@ banbot按功能特性和依赖关系划分了若干不同的包，而常用的�
 &emsp;config utils core
 #### [orm](orm.md)
 orm被其下的ormo,ormu两个子包引用。
-* orm包含时序数据库读写访问如K线kline、品种exsymbol、空洞kHole、范围kInfo、交易日历、复权因子；
+* orm包含 QuestDB/TimescaleDB 的时序数据库读写，包括 OHLCV、任意自定义序列、品种、覆盖范围、交易日历和复权因子；
 * ormo包含订单相关：交易任务BotTask，持仓记录InOutOrder、交易所订单ExOrder；
 * ormu包含WebUI相关：回测任务记录。
 
 &emsp;exg config  
 #### [data](data.md)
-回测和实盘K线数据读取、预热、订阅等。
-* IProvider是某交易所某市场下多品种K线数据提供者，IKlineFeeder是单品种K线数据提供者。一个IProvider可包含多个IKlineFeeder，一个IKlineFeeder可包含多个周期数据。
+回测和实盘的数据读取、预热、订阅等。
+* IProvider 是交易所市场下多品种 OHLCV 数据提供者，IKlineFeeder 是单品种 K 线数据提供者。一个 IProvider 可包含多个 IKlineFeeder，一个 IKlineFeeder 可包含多个周期数据。
 * IProvider的HistProvider对应回测数据提供者，LiveProvider对应实盘数据提供者（会从spider进程订阅数据）。
 * IKlineFeeder的DBKlineFeeder对应回测，KlineFeeder对应实盘；TfKlineLoader可用于分批加载某个品种的指定周期K线，然后逐个读取的场景；一个KlineFeeder可包含多个TfKlineLoader。
 * Spider是公共数据实时订阅爬虫进程。可同时订阅多个交易所、多个市场、多个品种的价格、订单簿、K线等数据。一个Spider可供多个实盘机器人进程连接访问。
 * KLineWatcher用于接收来自Spider数据的客户端。被LiveProvider使用。
+* DataSource、SeriesRuntime 和 HistSeriesFeeder 用于任意自定义时序数据的注册、历史回填、实时订阅与回放。
 
 &emsp;orm exg config 
 #### [strat](strat.md)
@@ -83,54 +84,19 @@ WebUI和Dashboard UI的服务器端&前端资源。
 &emsp;optmize live data 
 
 
-## 各个Go包中的重要全局变量
-```text
-core
-    Ctx context.Context // 全局上下文，可select <- core.Ctx响应全局退出事件
-    StopAll func() // 发出全局退出事件
-    NoEnterUntil map[string]int64 // 在给定截止时间戳之前禁止开单
-    RunMode string // RunModeLive / RunModeBackTest / RunModeOther
-    RunEnv string // RunEnvProd / RunEnvTest / RunEnvDryRun
-    StartAt int64 // 启动时间，13位时间戳
-    LiveMode bool // 是否是实时模式：实盘+模拟运行
-    BackTestMode bool // 是否是回测模式
-    EnvReal bool // LiveMode && RunEnv != RunEnvDryRun 提交订单到交易所run_env:prod/test
-    ExgName string // 当前交易所名称
-    Market string // 当前市场
-    IsContract bool // 当前市场是否是合约市场, linear/inverse/option
-    Pairs []string // 全局所有的标的，按标的刷新后的顺序
-    OdBooks map[string]*banexg.OrderBook // 缓存所有收到的订单簿
-    
-btime
-    CurTimeMS int64 // 当前时间戳，仅回测模式下使用
-    LocShow *time.Location // 用于显示的时区
-    UTCLocale *time.Location
+## 任务运行态与兼容边界
 
-biz
-    AccOdMgrs // 订单簿对象，必定不为空
-    AccLiveOdMgrs // 实盘订单簿对象，实盘时不为空
-    AccWallets // 钱包
-    
-data
-    Spider // 爬虫
+`runtime.Process` 只管理少量进程级构造资源，例如 Runtime ID 与按存储身份共享的 SID 分配器。每个 `runtime.Runtime` 则拥有该任务的 `core.State`、`config.Snapshot`、`btime.ClockState`、市场和交易对状态、策略任务、订单与钱包、调度器、通知、数据目录和显式存储/交易所依赖。业务包通过 `Runtime.BizDeps()` 或 `Runtime.DataDeps()` 接收所需的窄依赖。
 
-orm
-    HistODs // 已平仓的订单：全部出场，仅回测使用
-    AccOpenODs // 打开的订单：尚未提交、已提交未入场、部分入场，全部入场，部分出场
-    AccTriggerODs // 尚未提交的限价入场单，等待轮询提交到交易所，仅实盘使用
-    AccTaskIDs // 当前任务ID
-    AccTasks // 当前任务
+因此，普通入口创建的回测、实盘和优化任务具有各自的取消、关闭和可变业务状态；同一 `Process` 可以创建多个 Runtime。`context.Context` 仅用于取消、deadline 与 I/O 生命周期，不承载业务状态。
 
-exg
-    Default  // 交易所对象
+为兼容旧的嵌入式调用和部分维护命令，仓库仍保留少量包级 facade（例如旧的配置、时间与交易状态访问接口）。这些路径由兼容边界保护，不能作为新任务的状态访问方式；新代码应从构造参数、具体 receiver 或 Runtime 依赖投影取得状态。
 
-strat
-    StagyMap // 策略注册map
-    Versions // 策略版本
-    Envs // 涉及的所有K线环境：Pair+TimeFrame
-    PairTFStags // 标的+TF+策略 pair:[stratID]TradeStrat
-    AccJobs // 涉及的所有标的 account: pair_tf: [stratID]StratJob
-    AccInfoJobs // 涉及的所有辅助信息标的 account: pair_tf: [stratID]StratJob
-    ForbidJobs // 禁止创建的策略任务 pair_TF: stratID: empty
-```
-注意：所有Acc开头的变量都是支持多账户的map
+## 因子运行域
+
+[因子 API](factor.md)覆盖图、快照、研究和 runner；execution 提供共享账户，runtime 负责借用和生命周期，entry 负责配置及资源装配。
+
+
+## 实例运行与服务 API
+
+[runtime](runtime.md)说明 Process/Runtime owner 与取消/join；[com](com.md)说明市场状态和 scheduler；[rpc](rpc.md)说明实例通知；[web](web.md)说明开发工厂与实时 HTTP/WS 生命周期。

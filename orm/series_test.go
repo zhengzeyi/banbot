@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/banbox/banbot/utils"
 	"github.com/banbox/banexg"
 )
 
@@ -200,11 +201,11 @@ func TestResampleSeriesRecordsUsesAggRules(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		firstVal, err := seriesFloatAny(first)
+		firstVal, err := utils.ToFloat64(first)
 		if err != nil {
 			return nil, err
 		}
-		lastVal, err := seriesFloatAny(last)
+		lastVal, err := utils.ToFloat64(last)
 		if err != nil {
 			return nil, err
 		}
@@ -259,6 +260,27 @@ func TestResampleDataSeriesUsesAggRulesForGenericSeries(t *testing.T) {
 	}
 	if got[0].Values["rate"] != 2.0 || got[0].Values["volume"] != 7.0 {
 		t.Fatalf("unexpected values: %+v", got[0].Values)
+	}
+}
+
+func TestInferSeriesFieldsUsesFirstNonNullValue(t *testing.T) {
+	got := inferSeriesFields([]*DataSeries{
+		{Values: map[string]any{"count": nil, "all_null": nil}},
+		{Values: map[string]any{"count": int64(7)}},
+	})
+
+	if len(got) != 2 {
+		t.Fatalf("inferred fields = %+v, want count and all_null", got)
+	}
+	byName := make(map[string]string, len(got))
+	for _, field := range got {
+		byName[field.Name] = field.Type
+	}
+	if byName["count"] != "int" {
+		t.Fatalf("NULL-first field type = %q, want int", byName["count"])
+	}
+	if byName["all_null"] != "json" {
+		t.Fatalf("all-NULL field type = %q, want json fallback", byName["all_null"])
 	}
 }
 

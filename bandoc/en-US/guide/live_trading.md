@@ -75,7 +75,7 @@ Dry-run mode uses 1-minute K-line matching for local orders, so order status wil
 :::
 
 ## 3. Starting the Trading Bot
-You need to start both the spider process and the bot process. The spider process is used to subscribe to and update public data such as candlestick charts and order books, saving them to the database.
+You need to start both the spider process and the bot process. The spider process is used to subscribe to and update public exchange data such as K-lines and order books, saving them to the database. Registered custom time-series data sources automatically backfill historical data when the bot starts and may provide their own live subscriptions; they do not depend on Spider.
 The bot process subscribes to candlestick data and other information from the spider process and executes trading strategies. You can start multiple bot processes to run different strategies.
 
 Strategies and trading accounts consume minimal resources. On a 2-core, 2GB VPS, you can start multiple bot processes, and a single bot process can be configured with hundreds of strategies and hundreds of trading accounts.
@@ -294,3 +294,17 @@ Grant execution permissions to the script:
 ```shell
 chmod +x /ban/check_bot.sh
 ```
+
+## Factor and cross-sectional engine
+
+bot trade assembles factor/mixed policies only with verified entry.RegisterFactorLiveBinding evidence: transport, symbol metadata, revision/publication mapping, funding and startup reconciliation. execution.live_provider selects a registered name; verified-session is an application example, not a built-in accepted venue. Missing capabilities fail startup without paper fallback.
+
+Remove archive, Prepare/Warmup, reconcile and Commit a generation. Observe current records and Flush complete/timed-out barriers. Stop then Join before releasing resources; failed candidates preserve the old generation. Live rejects history-ic; InitialNAV deposits no funds. trade --dry-run is separate historical paper replay.
+
+See [Multi-factor strategies](./factor.md) and [Factor API](../api/factor.md).
+
+## Resource and control boundaries
+
+entry assembles the Runtime, accounts, exchange, sources and services for one live run. Shutdown waits for workers and callbacks before releasing owned resources. Embedded callers must inject dependencies and follow the owner’s Close/Stop/Join contract; changing package configuration cannot safely switch an active account.
+
+Live HTTP/WS and RPC provide control and observation through the session’s snapshot, accounts, clock, orders and wallets. They do not own the factor graph or computation state. Development WebUI factories create separate backtest Runtimes; their task boundary differs from the live ApiServer session. See [Web API](../api/web.md), [RPC API](../api/rpc.md) and [Runtime API](../api/runtime.md).
